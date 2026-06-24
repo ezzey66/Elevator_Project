@@ -7,7 +7,7 @@
 #include "esp_now.h"
 #include "esp_netif.h"
 
-// Receiver #2's REAL MAC address (The one with the sensor)
+// Receiver's MAC address (Board #2)
 uint8_t receiver_mac[] = {0x30, 0x76, 0xF5, 0xF7, 0x57, 0x48};
 
 // 1. New Callback: This fires automatically whenever Board #2 sends a message
