@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "controller_esp32"
+		},
+		{
+			"path": "esp32_2"
+		}
+	],
+	"settings": {}
+}
