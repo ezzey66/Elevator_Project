@@ -80,7 +80,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // LOCK TO CHANNEL 1: Ensures the controller sits on the right frequency lane
+    // LOCK TO CHANNEL 1: Ensures the controller sits on the right frequency lane 
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE)); 
 
     // 4. Initialize ESP-NOW
