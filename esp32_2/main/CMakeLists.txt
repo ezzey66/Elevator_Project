@@ -1,2 +1,12 @@
-idf_component_register(SRCS "reed_switch.c" "main.c" "sensor.c"
-                       INCLUDE_DIRS ".") 
+idf_component_register(
+    SRCS
+        "main.c"
+        "reed_switch.c"
+        "sensor.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        bt
+        esp_driver_gpio
+        nvs_flash
+)
