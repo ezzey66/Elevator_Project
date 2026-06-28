@@ -7,6 +7,7 @@
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "esp_netif.h"
+#include "esp_event.h"
 
 // Receiver's MAC address (Board #2)
 uint8_t receiver_mac[] = {0x30, 0x76, 0xF5, 0xF7, 0x57, 0x48};
