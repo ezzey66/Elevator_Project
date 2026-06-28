@@ -34,6 +34,8 @@ static const uint8_t TARGET_BDA[ESP_BD_ADDR_LEN] = {
 #define AWAY_RSSI_THRESHOLD_DBM (-78.0f)
 #define NEAR_CONFIRM_COUNT      (3)
 #define AWAY_CONFIRM_COUNT      (5)
+#define SIGNAL_STALE_MS         (2500)
+#define SIGNAL_LOST_MS          (6000)
 
 #define DASHBOARD_AP_SSID       "ElevatorBLE-Test"
 #define DASHBOARD_AP_PASSWORD   "elevator123"
@@ -62,7 +64,7 @@ static esp_ble_scan_params_t ble_scan_params = {
     .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
     .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
     .scan_interval = 0x50,
-    .scan_window = 0x30,
+    .scan_window = 0x50,
     .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE,
 };
 
@@ -183,15 +185,18 @@ static esp_err_t dashboard_page_handler(httpd_req_t *req)
         "<div class='panel'><div class='label'>Rough range</div><div id='range' class='value'>--</div></div>"
         "<div class='panel wide small'>Raw RSSI: <b id='raw' class='mono'>--</b> dBm<br>"
         "Smoothed RSSI: <b id='smooth' class='mono'>--</b> dBm<br>"
-        "Formula estimate: <b id='distance' class='mono'>--</b> m</div></div></div><script>"
+        "Formula estimate: <b id='distance' class='mono'>--</b> m<br>"
+        "Last BLE packet: <b id='packet' class='mono'>--</b></div></div></div><script>"
         "async function tick(){try{const r=await fetch('/data',{cache:'no-store'});const d=await r.json();"
-        "const s=document.getElementById('status');s.textContent=d.seen?(d.near?'CONFIRMED NEAR ELEVATOR':'NOT CONFIRMED NEAR'):'Waiting...';"
-        "s.className='value '+(d.near?'near':(d.seen?'warn':'away'));document.getElementById('zone').textContent=d.seen?d.zone:'--';"
+        "const active=d.seen&&d.fresh;const stale=d.seen&&!d.fresh;"
+        "const s=document.getElementById('status');s.textContent=active?(d.near?'CONFIRMED NEAR ELEVATOR':'NOT CONFIRMED NEAR'):(stale?'SIGNAL STALE':'Waiting...');"
+        "s.className='value '+(active&&d.near?'near':(active?'warn':'away'));document.getElementById('zone').textContent=active?d.zone:'--';"
         "document.getElementById('range').textContent=d.seen?d.range:'--';document.getElementById('distance').textContent=d.seen?d.distance_m.toFixed(2):'--';"
         "document.getElementById('raw').textContent=d.seen?d.raw_rssi:'--';document.getElementById('smooth').textContent=d.seen?d.smoothed_rssi.toFixed(1):'--';"
-        "document.getElementById('seen').textContent=d.seen?d.last_seen_age_ms+' ms ago':'waiting';"
-        "const pct=d.seen?Math.max(0,Math.min(100,(d.smoothed_rssi+90)*3.2)):0;document.getElementById('strength').style.width=pct+'%';}catch(e){}}"
-        "setInterval(tick,700);tick();</script></body></html>";
+        "document.getElementById('seen').textContent=active?'live':(stale?'stale':'waiting');"
+        "document.getElementById('packet').textContent=d.seen?d.last_seen_age_ms+' ms ago':'waiting';"
+        "const pct=active?Math.max(0,Math.min(100,(d.smoothed_rssi+90)*3.2)):0;document.getElementById('strength').style.width=pct+'%';}catch(e){}}"
+        "setInterval(tick,500);tick();</script></body></html>";
 
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
@@ -208,18 +213,23 @@ static esp_err_t dashboard_data_handler(httpd_req_t *req)
     }
 
     int64_t age_ms = snapshot.seen ? (now_ms - snapshot.last_seen_ms) : -1;
+    bool fresh = snapshot.seen && age_ms <= SIGNAL_STALE_MS;
+    bool near = fresh && snapshot.confirmed_near;
+    const char *zone = fresh ? signal_zone_text(snapshot.smoothed_rssi) : "Signal stale";
+
     char json[384];
     int len = snprintf(json, sizeof(json),
-                       "{\"seen\":%s,\"near\":%s,\"raw_rssi\":%d,"
+                       "{\"seen\":%s,\"fresh\":%s,\"near\":%s,\"raw_rssi\":%d,"
                        "\"smoothed_rssi\":%.1f,\"distance_m\":%.2f,"
                        "\"zone\":\"%s\",\"range\":\"%s\","
                        "\"last_seen_age_ms\":%lld}",
                        snapshot.seen ? "true" : "false",
-                       snapshot.confirmed_near ? "true" : "false",
+                       fresh ? "true" : "false",
+                       near ? "true" : "false",
                        snapshot.raw_rssi,
                        snapshot.smoothed_rssi,
                        snapshot.estimated_distance_m,
-                       signal_zone_text(snapshot.smoothed_rssi),
+                       zone,
                        distance_range_text(snapshot.smoothed_rssi),
                        (long long)age_ms);
 
