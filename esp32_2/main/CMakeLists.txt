@@ -7,6 +7,12 @@ idf_component_register(
         "."
     REQUIRES
         bt
+        esp_event
         esp_driver_gpio
+        esp_http_server
+        esp_netif
+        esp_timer
+        esp_wifi
         nvs_flash
+        driver
 )
