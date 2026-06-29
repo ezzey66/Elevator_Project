@@ -3,49 +3,45 @@
 #include "freertos/task.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "esp_err.h"
 
-#define I2C_MASTER_SDA_IO     14    // Your SDA pin
-#define I2C_MASTER_SCL_IO     13    // Your SCL pin
-#define M5_RELAY_ADDR         0x26  // Relay I2C address
-#define RELAY_REG             0x10  // Target control register
+#define I2C_MASTER_SDA_IO     21    // ESP32 default I2C SDA pin
+#define I2C_MASTER_SCL_IO     22    // ESP32 default I2C SCL pin
+#define M5_RELAY_ADDR         0x26  // Official M5Stack M121 relay module address
+#define RELAY_REG             0x10  // Official relay control register
+#define I2C_SCL_SPEED_HZ      200000 // Official examples use 200 kHz
 
 static const char *TAG = "M5_RELAY";
 
 void app_main(void)
 {
+    esp_err_t err;
+
     // 1. Configure the I2C Master Bus
-    i2c_master_bus_config_t bus_config = {
+    i2c_master_bus_config_t scan_bus_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .i2c_port = I2C_NUM_0,
         .sda_io_num = I2C_MASTER_SDA_IO,
         .scl_io_num = I2C_MASTER_SCL_IO,
         .flags.enable_internal_pullup = true,
     };
-    i2c_master_bus_handle_t bus_handle;
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &bus_handle));
+    i2c_master_bus_handle_t bus_handle = NULL;
 
-    // 2. Add the Relay Device to the Bus
-    i2c_device_config_t dev_config = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = M5_RELAY_ADDR,
-        .scl_speed_hz = 100000, // 100 kHz standard mode
-    };
-    i2c_master_dev_handle_t dev_handle;
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_config, &dev_handle));
+    err = i2c_new_master_bus(&scan_bus_config, &bus_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2c_new_master_bus failed: %s", esp_err_to_name(err));
+        return;
+    }
 
-    ESP_LOGI(TAG, "I2C Initialized on SDA: %d, SCL: %d", I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
+    ESP_LOGI(TAG, "Testing I2C address 0x%02x on SDA:%d SCL:%d", M5_RELAY_ADDR, scan_bus_config.sda_io_num, scan_bus_config.scl_io_num);
 
     while (1) {
-        // Buffer payload: [Register Address, Relay Mask Value]
-        uint8_t turn_on_data[2] = {RELAY_REG, 0x0F};  // 0x0F (0b1111) -> All 4 relays ON
-        uint8_t turn_off_data[2] = {RELAY_REG, 0x00}; // 0x00 (0b0000) -> All 4 relays OFF
-
-        ESP_LOGI(TAG, "Turning ALL relays ON");
-        ESP_ERROR_CHECK(i2c_master_transmit(dev_handle, turn_on_data, sizeof(turn_on_data), -1));
-        vTaskDelay(pdMS_TO_TICKS(2000)); // Delay 2 seconds
-
-        ESP_LOGI(TAG, "Turning ALL relays OFF");
-        ESP_ERROR_CHECK(i2c_master_transmit(dev_handle, turn_off_data, sizeof(turn_off_data), -1));
-        vTaskDelay(pdMS_TO_TICKS(2000)); // Delay 2 seconds
+        err = i2c_master_probe(bus_handle, M5_RELAY_ADDR, 1000);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Relay responded at 0x%02x", M5_RELAY_ADDR);
+        } else {
+            ESP_LOGW(TAG, "No response from relay at 0x%02x: %s", M5_RELAY_ADDR, esp_err_to_name(err));
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
