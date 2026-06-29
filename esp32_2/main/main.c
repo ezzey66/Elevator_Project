@@ -28,14 +28,14 @@ static const uint8_t TARGET_BDA[ESP_BD_ADDR_LEN] = {
 
 #define RSSI_AT_ONE_METER_DBM (-59)
 #define PATH_LOSS_EXPONENT    (2.0f)
-#define RSSI_SMOOTHING_ALPHA  (0.12f)
+#define RSSI_SMOOTHING_ALPHA  (0.50f)  // Very aggressive smoothing for fast response
 
-#define NEAR_RSSI_THRESHOLD_DBM (-68.0f)
-#define AWAY_RSSI_THRESHOLD_DBM (-78.0f)
-#define NEAR_CONFIRM_COUNT      (3)
-#define AWAY_CONFIRM_COUNT      (5)
-#define SIGNAL_STALE_MS         (2500)
-#define SIGNAL_LOST_MS          (6000)
+#define NEAR_RSSI_THRESHOLD_DBM (-60.0f)  // Tightened from -62.0 for closer immediate zone
+#define AWAY_RSSI_THRESHOLD_DBM (-75.0f)  // Tightened from -80.0 for better discrimination (15dBm gap)
+#define NEAR_CONFIRM_COUNT      (1)       // Reduced from 2 - single packet confirms NEAR
+#define AWAY_CONFIRM_COUNT      (2)       // Reduced from 3 for faster away detection
+#define SIGNAL_STALE_MS         (3500)    // Reduced from 5000 - more responsive to packet loss
+#define SIGNAL_LOST_MS          (7000)    // Reduced from 10000 - match max observed gap
 
 #define DASHBOARD_AP_SSID       "ElevatorBLE-Test"
 #define DASHBOARD_AP_PASSWORD   "elevator123"
@@ -58,13 +58,14 @@ static float smoothed_rssi;
 static bool robot_confirmed_near;
 static int near_count;
 static int away_count;
+static int64_t last_rssi_update_ms;  // Track when last packet was received
 
 static esp_ble_scan_params_t ble_scan_params = {
     .scan_type = BLE_SCAN_TYPE_ACTIVE,
     .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
     .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
-    .scan_interval = 0x50,
-    .scan_window = 0x50,
+    .scan_interval = 0x10,  // 20ms interval - very aggressive scanning
+    .scan_window = 0x10,    // 20ms window - continuous scanning for reliable packet capture
     .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE,
 };
 
@@ -117,12 +118,43 @@ static float update_smoothed_rssi(int raw_rssi)
     if (!rssi_filter_ready) {
         smoothed_rssi = (float)raw_rssi;
         rssi_filter_ready = true;
+        last_rssi_update_ms = esp_timer_get_time() / 1000;
         return smoothed_rssi;
     }
 
     smoothed_rssi = (RSSI_SMOOTHING_ALPHA * (float)raw_rssi) +
                     ((1.0f - RSSI_SMOOTHING_ALPHA) * smoothed_rssi);
+    last_rssi_update_ms = esp_timer_get_time() / 1000;
     return smoothed_rssi;
+}
+
+// Apply exponential decay to RSSI during gaps between packets
+static float apply_rssi_decay(void)
+{
+    if (!rssi_filter_ready) {
+        return smoothed_rssi;
+    }
+    
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    int64_t time_since_last_ms = now_ms - last_rssi_update_ms;
+    
+    if (time_since_last_ms <= 500) {
+        // Recent packet, no decay
+        return smoothed_rssi;
+    }
+    
+    // Apply exponential decay: weaken signal gradually
+    // Decay rate: -0.5 dBm per 500ms, accelerating after 1 second
+    float decay = 0.0f;
+    if (time_since_last_ms < 1000) {
+        decay = (float)(time_since_last_ms - 500) / 1000.0f;  // 0 to 0.5 dBm
+    } else if (time_since_last_ms < 2000) {
+        decay = 0.5f + (float)(time_since_last_ms - 1000) / 1000.0f;  // 0.5 to 1.5 dBm
+    } else {
+        decay = 1.5f + (float)(time_since_last_ms - 2000) / 500.0f;  // Accelerating decay
+    }
+    
+    return smoothed_rssi - decay;
 }
 
 static void update_robot_proximity_state(float filtered_rssi)
@@ -214,8 +246,23 @@ static esp_err_t dashboard_data_handler(httpd_req_t *req)
 
     int64_t age_ms = snapshot.seen ? (now_ms - snapshot.last_seen_ms) : -1;
     bool fresh = snapshot.seen && age_ms <= SIGNAL_STALE_MS;
+    
+    // Apply RSSI decay for display - smoothly transition during gaps
+    float decayed_rssi = snapshot.smoothed_rssi;
+    if (snapshot.seen && age_ms > 500) {
+        float decay = 0.0f;
+        if (age_ms < 1000) {
+            decay = (float)(age_ms - 500) / 1000.0f;
+        } else if (age_ms < 2000) {
+            decay = 0.5f + (float)(age_ms - 1000) / 1000.0f;
+        } else {
+            decay = 1.5f + (float)(age_ms - 2000) / 500.0f;
+        }
+        decayed_rssi = snapshot.smoothed_rssi - decay;
+    }
+    
     bool near = fresh && snapshot.confirmed_near;
-    const char *zone = fresh ? signal_zone_text(snapshot.smoothed_rssi) : "Signal stale";
+    const char *zone = fresh ? signal_zone_text(decayed_rssi) : "Signal stale";
 
     char json[384];
     int len = snprintf(json, sizeof(json),
@@ -227,10 +274,10 @@ static esp_err_t dashboard_data_handler(httpd_req_t *req)
                        fresh ? "true" : "false",
                        near ? "true" : "false",
                        snapshot.raw_rssi,
-                       snapshot.smoothed_rssi,
-                       snapshot.estimated_distance_m,
+                       decayed_rssi,
+                       estimate_distance_meters(decayed_rssi),
                        zone,
-                       distance_range_text(snapshot.smoothed_rssi),
+                       distance_range_text(decayed_rssi),
                        (long long)age_ms);
 
     httpd_resp_set_type(req, "application/json");
@@ -316,6 +363,29 @@ static void esp_ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t 
     }
 }
 
+// Background task that monitors packet gaps and applies RSSI decay
+static void rssi_gap_monitor_task(void *pvParameter)
+{
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(500));  // Check every 500ms
+        
+        if (!rssi_filter_ready) {
+            continue;
+        }
+        
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        int64_t time_since_last_ms = now_ms - last_rssi_update_ms;
+        
+        // Only apply decay during gaps (>500ms without packet)
+        if (time_since_last_ms > 500 && time_since_last_ms < SIGNAL_LOST_MS) {
+            float decayed_rssi = apply_rssi_decay();
+            
+            // Update state based on decayed RSSI - allows natural transitions during gaps
+            update_robot_proximity_state(decayed_rssi);
+        }
+    }
+}
+
 void app_main(void)
 {
     dashboard_mutex = xSemaphoreCreateMutex();
@@ -338,6 +408,9 @@ void app_main(void)
     check_step("esp_bluedroid_enable", esp_bluedroid_enable());
     check_step("esp_ble_gap_register_callback", esp_ble_gap_register_callback(esp_ble_gap_cb));
     check_step("esp_ble_gap_set_scan_params", esp_ble_gap_set_scan_params(&ble_scan_params));
+
+    // Start background task to monitor packet gaps and apply RSSI decay
+    xTaskCreate(rssi_gap_monitor_task, "rssi_monitor", 2048, NULL, 5, NULL);
 
     printf("[BLE SCANNER] Initialized. Looking for target MAC %02X:%02X:%02X:%02X:%02X:%02X...\n",
            TARGET_BDA[0], TARGET_BDA[1], TARGET_BDA[2], TARGET_BDA[3], TARGET_BDA[4], TARGET_BDA[5]);
