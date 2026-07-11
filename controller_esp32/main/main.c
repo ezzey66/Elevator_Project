@@ -1,119 +1,137 @@
-#include <stdio.h>
+﻿#include <stdio.h>
 #include <string.h>
-#include <stdbool.h> 
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "esp_netif.h"
 
-// Receiver's MAC address (Board #2)
-uint8_t receiver_mac[] = {0x30, 0x76, 0xF5, 0xF7, 0x57, 0x48};
+#define RELAY_CALL_PIN         GPIO_NUM_14
+#define RELAY_DOOR_HOLD_PIN    GPIO_NUM_13
+#define RELAY_FLOOR_SELECT_PIN GPIO_NUM_12
 
-// State Variables to prevent print-spamming
-volatile bool elevator_called = false;
-int state_timer = 0;
+#define CMD_CALL_ELEVATOR      "CMD_CALL_ELEVATOR"
+#define CMD_HOLD_DOOR_OPEN     "CMD_HOLD_DOOR_OPEN"
+#define CMD_RELEASE_DOOR       "CMD_RELEASE_DOOR"
+#define CMD_SELECT_FLOOR       "CMD_SELECT_FLOOR"
 
-// 1. Updated Callback: Tracks connections and switch events
-void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
-    char incoming_msg[32];
-    snprintf(incoming_msg, sizeof(incoming_msg), "%.*s", len, data);
+static const uint8_t board2_mac[6] = {0x30, 0x76, 0xF5, 0xF7, 0x57, 0x48};
 
-    // --- NEW: Handle Bootup Handshake Connection Message ---
-    if (strcmp(incoming_msg, "BOARD_2_CONNECTED") == 0) {
-        printf("\n=========================================\n");
-        printf("Packet Received From: %02X:%02X:%02X:%02X:%02X:%02X\n",
-               recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
-               recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
-        printf("STATUS: Board #2 (Floor 2 Station) has successfully CONNECTED!\n");
-        printf("Wireless Link established on Channel 1.\n");
-        printf("=========================================\n");
-    }
-    // --- Handle Magnet Switch Triggers ---
-    else if (strcmp(incoming_msg, "CALL_ELEVATOR_FLOOR_2") == 0) {
-        if (!elevator_called) {
-            printf("\n=========================================\n");
-            printf("Packet Received From: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                   recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
-                   recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
-            printf("Incoming Wireless Signal: %s\n", incoming_msg);
-            printf("ACTION: Robot detected at Floor 2! Dispatching elevator...\n");
-            printf("=========================================\n");
-            
-            elevator_called = true; 
-            state_timer = 0;        
-        }
-    } 
-    // --- Handle Clear Signals ---
-    else if (strcmp(incoming_msg, "FLOOR_2_CLEAR") == 0) {
-        if (elevator_called) {
-            printf("\nSTATUS: Floor 2 area is now clear.\n");
-            elevator_called = false;
-        }
-    }
+static volatile bool pulse_call_requested = false;
+static volatile bool pulse_select_requested = false;
+
+static void relay_init(void)
+{
+    gpio_config_t config = {
+        .pin_bit_mask = (1ULL << RELAY_CALL_PIN) |
+                        (1ULL << RELAY_DOOR_HOLD_PIN) |
+                        (1ULL << RELAY_FLOOR_SELECT_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    gpio_config(&config);
+    gpio_set_level(RELAY_CALL_PIN, 0);
+    gpio_set_level(RELAY_DOOR_HOLD_PIN, 0);
+    gpio_set_level(RELAY_FLOOR_SELECT_PIN, 0);
 }
 
-// Optional callback left in case the controller needs to talk back later
-void on_data_sent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
-    if (status == ESP_NOW_SEND_SUCCESS) {
-        printf("Delivery Status: Success\n");
+static void pulse_relay(gpio_num_t pin)
+{
+    gpio_set_level(pin, 1);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    gpio_set_level(pin, 0);
+}
+
+static void process_incoming_command(const char *command)
+{
+    if (strcmp(command, CMD_CALL_ELEVATOR) == 0) {
+        printf("[CTRL] Received CMD_CALL_ELEVATOR\n");
+        pulse_call_requested = true;
+    } else if (strcmp(command, CMD_HOLD_DOOR_OPEN) == 0) {
+        printf("[CTRL] Received CMD_HOLD_DOOR_OPEN\n");
+        gpio_set_level(RELAY_DOOR_HOLD_PIN, 1);
+    } else if (strcmp(command, CMD_RELEASE_DOOR) == 0) {
+        printf("[CTRL] Received CMD_RELEASE_DOOR\n");
+        gpio_set_level(RELAY_DOOR_HOLD_PIN, 0);
+    } else if (strcmp(command, CMD_SELECT_FLOOR) == 0) {
+        printf("[CTRL] Received CMD_SELECT_FLOOR\n");
+        pulse_select_requested = true;
     } else {
-        printf("Delivery Status: FAIL\n");
+        printf("[CTRL] Unknown command: %s\n", command);
     }
 }
 
-void app_main(void) {
-    // 2. Initialize NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
+{
+    if (len <= 0 || len >= 64) {
+        return;
     }
-    ESP_ERROR_CHECK(ret);
 
-    // 3. Initialize Wi-Fi
+    char incoming[64] = {0};
+    snprintf(incoming, sizeof(incoming), "%.*s", len, data);
+    printf("[ESP-NOW] RX from %02X:%02X:%02X:%02X:%02X:%02X -> %s\n",
+           recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+           recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5],
+           incoming);
+
+    process_incoming_command(incoming);
+}
+
+static void on_data_sent(const esp_now_send_info_t *info, esp_now_send_status_t status)
+{
+    printf("[ESP-NOW] TX status: %s\n", status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
+}
+
+void app_main(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
 
-    // LOCK TO CHANNEL 1: Ensures the controller sits on the right frequency lane 
-    ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE)); 
-
-    // 4. Initialize ESP-NOW
     ESP_ERROR_CHECK(esp_now_init());
-
-    // 5. Register BOTH callbacks
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(on_data_recv));
     ESP_ERROR_CHECK(esp_now_register_send_cb(on_data_sent));
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(on_data_recv)); 
 
-    // 6. Register the Peer
     esp_now_peer_info_t peer_info = {};
-    memcpy(peer_info.peer_addr, receiver_mac, 6);
-    peer_info.channel = 1; 
+    memcpy(peer_info.peer_addr, board2_mac, sizeof(board2_mac));
+    peer_info.channel = 1;
     peer_info.encrypt = false;
+    ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
 
-    if (esp_now_add_peer(&peer_info) != ESP_OK) {
-        printf("Failed to add peer!\n");
-        return;
-    }
+    relay_init();
+    printf("[CTRL] Controller online, relay pins initialized.\n");
 
-    printf("Elevator Control Unit Online. Waiting for wireless requests...\n");
-    
-    // 7. Simulated Travel Task Loop
     while (1) {
-        if (elevator_called) {
-            state_timer++;
-            
-            if (state_timer >= 5) {
-                printf("\n[ELEVATOR] Car has arrived at Floor 2. Opening doors for the robot!\n\n");
-                elevator_called = false; 
-                state_timer = 0;         
-            }
+        if (pulse_call_requested) {
+            pulse_call_requested = false;
+            printf("[RELAY] Pulsing CALL ELEVATOR relay.\n");
+            pulse_relay(RELAY_CALL_PIN);
         }
-        vTaskDelay(pdMS_TO_TICKS(1000)); 
+
+        if (pulse_select_requested) {
+            pulse_select_requested = false;
+            printf("[RELAY] Pulsing SELECT FLOOR relay.\n");
+            pulse_relay(RELAY_FLOOR_SELECT_PIN);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }

@@ -1,115 +1,206 @@
-#include <stdio.h>
+﻿#include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "esp_netif.h"
-#include "sensor.h"       // Keeps your optical sensor capability available
-#include "reed_switch.h"  // Includes your magnetic switch functions
 
-// Hardcoded MAC address of your Controller (#1) board
-uint8_t controller_mac[] = {0x30, 0x76, 0xF5, 0xF8, 0x4D, 0x7C}; 
+#define CMD_CALL_ELEVATOR      "CMD_CALL_ELEVATOR"
+#define CMD_HOLD_DOOR_OPEN     "CMD_HOLD_DOOR_OPEN"
+#define CMD_RELEASE_DOOR       "CMD_RELEASE_DOOR"
+#define CMD_SELECT_FLOOR       "CMD_SELECT_FLOOR"
 
-// Callback function that triggers when data is received from the controller
-void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
-    printf("Message received from Controller!\n");
-    printf("Data length: %d bytes\n", len);
-    printf("Data content: %.*s\n", len, data);
-    printf("---------------------------\n");
-}
+#define FSM_TICK_MS            100
+#define BLE_CONFIRM_MS         10000
+#define DISTANCE_CONFIRM_MS    5000
+#define DOOR_CLOSE_TIMEOUT_MS  12000
 
-// NEW Callback: Tells us exactly if the controller physically acknowledged the packet
-void on_data_sent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
-    if (status == ESP_NOW_SEND_SUCCESS) {
-        printf("[ESP-NOW] Send Success! Controller received it.\n");
-    } else {
-        printf("[ESP-NOW] Send FAIL. Controller is offline or MAC is wrong.\n");
+#define SENSOR_REED_PIN        GPIO_NUM_NC  // TODO: assign reed switch pin
+#define SENSOR_DISTANCE_PIN    GPIO_NUM_NC  // TODO: assign distance sensor pin
+
+typedef enum {
+    STATE_SEARCHING_BLE,
+    STATE_VERIFY_DISTANCE,
+    STATE_WAIT_FOR_DOOR,
+    STATE_HOLD_DOOR_OPEN,
+    STATE_SELECT_FLOOR,
+    STATE_ERROR_STUCK,
+} elevator_state_t;
+
+static const uint8_t controller_mac[6] = {0x30, 0x76, 0xF5, 0xF8, 0x4D, 0x7C};
+
+static bool send_espnow_command(const char *command)
+{
+    esp_err_t err = esp_now_send(controller_mac, (const uint8_t *)command, strlen(command));
+    if (err != ESP_OK) {
+        printf("[ESP-NOW] Failed to send %s (err=%d)\n", command, err);
+        return false;
     }
+    printf("[ESP-NOW] Sent: %s\n", command);
+    return true;
 }
 
-void app_main(void) {
-    // 1. Initialize NVS (Required for Wi-Fi configurations)
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+static bool is_ble_target_visible(void)
+{
+    // TODO: implement BLE scan logic with NimBLE and detect the target beacon continuously.
+    return false;
+}
+
+static bool is_object_close(void)
+{
+    // TODO: implement distance sensor reading and return true if the object remains close.
+    return false;
+}
+
+static bool is_path_clear(void)
+{
+    // TODO: implement distance sensor reading to detect a cleared path after boarding.
+    return false;
+}
+
+static bool is_door_sealed(void)
+{
+    // TODO: implement reed switch input to return true when the door is sealed/closed.
+    return false;
+}
+
+static void init_sensor_placeholders(void)
+{
+    // TODO: configure SENSOR_REED_PIN and SENSOR_DISTANCE_PIN as GPIO inputs.
+    // Example:
+    // gpio_config_t io_conf = {};
+    // io_conf.pin_bit_mask = (1ULL << SENSOR_REED_PIN) | (1ULL << SENSOR_DISTANCE_PIN);
+    // io_conf.mode = GPIO_MODE_INPUT;
+    // io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    // io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    // io_conf.intr_type = GPIO_INTR_DISABLE;
+    // gpio_config(&io_conf);
+}
+
+void app_main(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+        err = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(err);
 
-    // 2. Initialize Wi-Fi stack
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-
-    // FORCE RADIO TO CHANNEL 1: Matches the controller frequency channel
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
 
-    // 3. GET AND PRINT THE MAC ADDRESS
-    uint8_t mac[6];
-    esp_wifi_get_mac(WIFI_IF_STA, mac);
-    printf("\n======================================================\n");
-    printf("MY RECEIVER MAC ADDRESS: %02X:%02X:%02X:%02X:%02X:%02X\n", 
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    printf("======================================================\n\n");
-
-    // 4. Initialize ESP-NOW
     ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_send_cb(NULL));
 
-    // 5. Register the callbacks
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(on_data_recv));
-    ESP_ERROR_CHECK(esp_now_register_send_cb(on_data_sent)); 
-
-    // 6. Register the Controller as an ESP-NOW Peer so we can send data to it
     esp_now_peer_info_t peer_info = {};
-    memcpy(peer_info.peer_addr, controller_mac, 6);
-    peer_info.channel = 1; // Locked to Channel 1
+    memcpy(peer_info.peer_addr, controller_mac, sizeof(controller_mac));
+    peer_info.channel = 1;
     peer_info.encrypt = false;
+    ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
 
-    if (esp_now_add_peer(&peer_info) != ESP_OK) {
-        printf("Failed to add controller peer!\n");
-        return;
-    }
+    init_sensor_placeholders();
+    printf("[FSM] Board 2 started. Waiting for BLE verification and sensors.\n");
 
-    // 7. Initialize BOTH components
-    init_proximity_sensor(); // Sets up D15
-    init_reed_switch();      // Sets up D4
+    elevator_state_t state = STATE_SEARCHING_BLE;
+    uint32_t ble_seen_ms = 0;
+    uint32_t distance_confirm_ms = 0;
+    uint32_t door_close_wait_ms = 0;
+    bool release_sent = false;
 
-    char message[32];
-    bool magnet_was_present = false;
-
-    // --- NEW: BOOTUP HANDSHAKE PACKET ---
-    printf("[SYSTEM] Sending bootup connection packet to Controller...\n");
-    snprintf(message, sizeof(message), "BOARD_2_CONNECTED");
-    esp_now_send(controller_mac, (uint8_t *)message, strlen(message));
-    // ------------------------------------
-
-    printf("Receiver is ready, listening, and monitoring D4 for Magnet...\n");
-
-    // 8. Infinite loop checking the reed switch state
     while (1) {
-        bool magnet_present = is_magnet_present(); 
+        bool target_seen = is_ble_target_visible();
+        bool object_close = is_object_close();
+        bool door_sealed = is_door_sealed();
+        bool path_clear = is_path_clear();
 
-        if (magnet_present && !magnet_was_present) {
-            printf("[MAGNET] Switch Closed! Sending call to Elevator...\n");
-            
-            snprintf(message, sizeof(message), "CALL_ELEVATOR_FLOOR_2");
-            esp_now_send(controller_mac, (uint8_t *)message, strlen(message));
-            
-            magnet_was_present = true; 
-        } 
-        else if (!magnet_present && magnet_was_present) {
-            printf("[MAGNET] Switch Opened! Clearing status...\n");
-            
-            snprintf(message, sizeof(message), "FLOOR_2_CLEAR");
-            esp_now_send(controller_mac, (uint8_t *)message, strlen(message));
-            
-            magnet_was_present = false;
+        switch (state) {
+            case STATE_SEARCHING_BLE:
+                if (target_seen) {
+                    ble_seen_ms += FSM_TICK_MS;
+                    if (ble_seen_ms >= BLE_CONFIRM_MS) {
+                        printf("[FSM] BLE target continuously seen for 10s. Transition to VERIFY_DISTANCE.\n");
+                        state = STATE_VERIFY_DISTANCE;
+                        distance_confirm_ms = 0;
+                    }
+                } else {
+                    if (ble_seen_ms > 0) {
+                        printf("[FSM] BLE target lost before confirmation. Resetting search.\n");
+                    }
+                    ble_seen_ms = 0;
+                }
+                break;
+
+            case STATE_VERIFY_DISTANCE:
+                if (object_close) {
+                    distance_confirm_ms += FSM_TICK_MS;
+                    if (distance_confirm_ms >= DISTANCE_CONFIRM_MS) {
+                        printf("[FSM] Distance verified for 5s. Sending CMD_CALL_ELEVATOR.\n");
+                        send_espnow_command(CMD_CALL_ELEVATOR);
+                        state = STATE_WAIT_FOR_DOOR;
+                    }
+                } else {
+                    printf("[FSM] Object lost during distance verification. Returning to SEARCHING_BLE.\n");
+                    state = STATE_SEARCHING_BLE;
+                    ble_seen_ms = 0;
+                    distance_confirm_ms = 0;
+                }
+                break;
+
+            case STATE_WAIT_FOR_DOOR:
+                if (!door_sealed) {
+                    printf("[FSM] Door opened. Sending CMD_HOLD_DOOR_OPEN.\n");
+                    send_espnow_command(CMD_HOLD_DOOR_OPEN);
+                    state = STATE_HOLD_DOOR_OPEN;
+                    release_sent = false;
+                }
+                break;
+
+            case STATE_HOLD_DOOR_OPEN:
+                if (path_clear) {
+                    printf("[FSM] Path clear detected. Sending CMD_RELEASE_DOOR and moving to SELECT_FLOOR.\n");
+                    send_espnow_command(CMD_RELEASE_DOOR);
+                    state = STATE_SELECT_FLOOR;
+                    door_close_wait_ms = 0;
+                    release_sent = true;
+                }
+                break;
+
+            case STATE_SELECT_FLOOR:
+                if (door_sealed) {
+                    printf("[FSM] Door sealed safely. Sending CMD_SELECT_FLOOR and resetting FSM.\n");
+                    send_espnow_command(CMD_SELECT_FLOOR);
+                    state = STATE_SEARCHING_BLE;
+                    ble_seen_ms = 0;
+                    distance_confirm_ms = 0;
+                    door_close_wait_ms = 0;
+                } else {
+                    door_close_wait_ms += FSM_TICK_MS;
+                    if (door_close_wait_ms >= DOOR_CLOSE_TIMEOUT_MS) {
+                        printf("[FSM] Door did not seal within 12s. Transition to ERROR_STUCK.\n");
+                        state = STATE_ERROR_STUCK;
+                    }
+                }
+                break;
+
+            case STATE_ERROR_STUCK:
+                if (!release_sent) {
+                    printf("[FSM] ERROR_STUCK: sending CMD_RELEASE_DOOR for safety.\n");
+                    send_espnow_command(CMD_RELEASE_DOOR);
+                    release_sent = true;
+                }
+                break;
         }
 
-        // Poll every 500ms
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(FSM_TICK_MS));
     }
 }
