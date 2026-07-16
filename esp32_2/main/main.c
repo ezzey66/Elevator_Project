@@ -9,6 +9,12 @@
 #include "esp_now.h"
 #include "esp_netif.h"
 
+static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
+{
+    (void)tx_info; // tx_info fields are implementation-specific; avoid dereferencing here
+    printf("[ESP-NOW] send callback invoked, status=%d\n", status);
+}
+
 #define CMD_CALL_ELEVATOR      "CMD_CALL_ELEVATOR"
 #define CMD_HOLD_DOOR_OPEN     "CMD_HOLD_DOOR_OPEN"
 #define CMD_RELEASE_DOOR       "CMD_RELEASE_DOOR"
@@ -100,7 +106,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
 
     ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_register_send_cb(NULL));
+    ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
 
     esp_now_peer_info_t peer_info = {};
     memcpy(peer_info.peer_addr, controller_mac, sizeof(controller_mac));
