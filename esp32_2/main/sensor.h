@@ -3,8 +3,8 @@
 
 #include <stdbool.h>
 
-// Define your GPIO Pin here (D15 maps to GPIO 15)
-#define SENSOR_PIN 15  
+// Distance sensor on GPIO 15
+#define SENSOR_PIN 15
 
 // Function declarations
 void init_proximity_sensor(void);

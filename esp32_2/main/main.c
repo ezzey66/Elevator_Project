@@ -9,6 +9,8 @@
 #include "esp_now.h"
 #include "esp_netif.h"
 #include "esp_bt.h"
+#include "sensor.h"
+#include "reed_switch.h"
 
 static bool ble_target_found = false;
 
@@ -28,8 +30,8 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 #define DISTANCE_CONFIRM_MS    5000
 #define DOOR_CLOSE_TIMEOUT_MS  12000
 
-#define SENSOR_REED_PIN        GPIO_NUM_2   // Reed switch (door status)
-#define SENSOR_DISTANCE_PIN    GPIO_NUM_15  // Distance sensor
+#define SENSOR_REED_PIN        REED_PIN
+#define SENSOR_DISTANCE_PIN    SENSOR_PIN
 
 typedef enum {
     STATE_SEARCHING_BLE,
@@ -65,35 +67,24 @@ static bool is_ble_target_visible(void)
 
 static bool is_object_close(void)
 {
-    // Read GPIO_NUM_15 (distance sensor): HIGH = object detected
-    int level = gpio_get_level(SENSOR_DISTANCE_PIN);
-    return (level == 1);
+    return is_robot_detected();
 }
 
 static bool is_path_clear(void)
 {
-    // Path is clear when distance sensor detects NO object
-    int level = gpio_get_level(SENSOR_DISTANCE_PIN);
-    return (level == 0);
+    return !is_robot_detected();
 }
 
 static bool is_door_sealed(void)
 {
-    // Read GPIO_NUM_2 (reed switch): HIGH = door closed/sealed
-    int level = gpio_get_level(SENSOR_REED_PIN);
-    return (level == 1);
+    return is_magnet_present();
 }
 
 static void init_sensor_pins(void)
 {
-    gpio_config_t io_conf = {};
-    io_conf.pin_bit_mask = (1ULL << SENSOR_REED_PIN) | (1ULL << SENSOR_DISTANCE_PIN);
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    gpio_config(&io_conf);
-    printf("[GPIO] Sensor pins initialized: Reed=%d, Distance=%d\n", SENSOR_REED_PIN, SENSOR_DISTANCE_PIN);
+    init_proximity_sensor();
+    init_reed_switch();
+    printf("[GPIO] Sensor modules initialized: Reed=%d, Distance=%d\n", SENSOR_REED_PIN, SENSOR_DISTANCE_PIN);
 }
 
 static void ble_scan_start(void)
