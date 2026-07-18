@@ -13,10 +13,16 @@
 #include "esp_gap_ble_api.h"
 #include "sensor.h"
 #include "reed_switch.h"
+#include "esp_log.h"
 
 static TickType_t ble_last_seen_ticks = 0;
 static const bool use_specific_beacon = false;
 static const uint8_t target_ble_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+static bool last_object_close = false;
+static bool last_path_clear = false;
+static bool last_door_sealed = false;
+static bool ble_prints_enabled = false; // set to true to re-enable BLE prints
+static bool enable_ble = false; // set to true to enable BLE scanning and stack
 
 static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 {
@@ -116,44 +122,22 @@ static void ble_scan_start(void)
     esp_err_t err = esp_ble_gap_set_scan_params(&scan_params);
     if (err != ESP_OK) {
         printf("[BLE] Failed to set scan params: %d\n", err);
-    } else {
-        printf("[BLE] Requested BLE scan parameters.\n");
     }
 }
 
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
     switch (event) {
-        case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
-            if (param->scan_param_cmpl.status == ESP_BT_STATUS_SUCCESS) {
-                esp_ble_gap_start_scanning(0);
-                printf("[BLE] Started BLE scanning.\n");
-            } else {
-                printf("[BLE] Scan parameter set failed, status=%d\n", param->scan_param_cmpl.status);
-            }
-            break;
-
-        case ESP_GAP_BLE_SCAN_START_COMPLETE_EVT:
-            if (param->scan_start_cmpl.status == ESP_BT_STATUS_SUCCESS) {
-                printf("[BLE] Scan start complete.\n");
-            } else {
-                printf("[BLE] Scan start failed, status=%d\n", param->scan_start_cmpl.status);
-            }
-            break;
-
         case ESP_GAP_BLE_SCAN_RESULT_EVT:
             if (param->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
                 if (is_target_ble_address(param->scan_rst.bda) && param->scan_rst.rssi > -80) {
                     ble_last_seen_ticks = xTaskGetTickCount();
-                    printf("[BLE] Beacon detected, RSSI=%d\n", param->scan_rst.rssi);
+                    if (ble_prints_enabled) {
+                        printf("[BLE] Beacon rssi=%d\n", param->scan_rst.rssi);
+                    }
                 }
             }
             break;
-
-        case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
-            printf("[BLE] Scan stopped.\n");
-            break;
-
         default:
             break;
     }
@@ -171,6 +155,11 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    /* Suppress verbose BLE/BT logs unless explicitly enabled */
+    if (!ble_prints_enabled) {
+        esp_log_level_set("*", ESP_LOG_ERROR);
+    }
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -187,23 +176,34 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
 
     init_sensor_pins();
-    
-    // Initialize BLE stack for beacon scanning
-    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
-    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
-    ESP_ERROR_CHECK(esp_bluedroid_init());
-    ESP_ERROR_CHECK(esp_bluedroid_enable());
-    ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_event_handler));
+    {
+        int reed_level = gpio_get_level(SENSOR_REED_PIN);
+        int dist_level = gpio_get_level(SENSOR_DISTANCE_PIN);
+        printf("[SENSOR_INIT] Reed raw=%d, Distance raw=%d\n", reed_level, dist_level);
+    }
 
-    ble_scan_start();
+    // Initialize BLE stack for beacon scanning (disabled by default)
+    if (enable_ble) {
+        ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+        bt_cfg.mode = ESP_BT_MODE_BLE;
+        ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
+        ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
+        ESP_ERROR_CHECK(esp_bluedroid_init());
+        ESP_ERROR_CHECK(esp_bluedroid_enable());
+        ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_event_handler));
+
+        ble_scan_start();
+    } else {
+        printf("[INFO] BLE disabled; only sensor outputs will be shown.\n");
+    }
     printf("[FSM] esp32_2 initialized. Waiting for BLE beacon and sensors.\n");
 
     elevator_state_t state = STATE_SEARCHING_BLE;
     uint32_t ble_seen_ms = 0;
     uint32_t distance_confirm_ms = 0;
     uint32_t door_close_wait_ms = 0;
+    uint32_t sensor_heartbeat_ms = 0;
     bool release_sent = false;
 
     while (1) {
@@ -211,6 +211,22 @@ void app_main(void)
         bool object_close = is_object_close();
         bool door_sealed = is_door_sealed();
         bool path_clear = is_path_clear();
+
+        if (object_close != last_object_close) {
+            if (object_close) {
+                printf("[SENSOR] Distance detected: object_close=1\n");
+            }
+            last_object_close = object_close;
+        }
+        if (path_clear != last_path_clear) {
+            last_path_clear = path_clear;
+        }
+        if (door_sealed != last_door_sealed) {
+            if (door_sealed) {
+                printf("[SENSOR] Reed activated: door_sealed=1\n");
+            }
+            last_door_sealed = door_sealed;
+        }
 
         switch (state) {
             case STATE_SEARCHING_BLE:
