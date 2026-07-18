@@ -51,19 +51,19 @@ static void pulse_relay(gpio_num_t pin)
 static void process_incoming_command(const char *command)
 {
     if (strcmp(command, CMD_CALL_ELEVATOR) == 0) {
-        printf("[CTRL] Received CMD_CALL_ELEVATOR\n");
+        printf("[CTRL] Received CMD_CALL_ELEVATOR. Triggering elevator call relay.\n");
         pulse_call_requested = true;
     } else if (strcmp(command, CMD_HOLD_DOOR_OPEN) == 0) {
-        printf("[CTRL] Received CMD_HOLD_DOOR_OPEN\n");
+        printf("[CTRL] Received CMD_HOLD_DOOR_OPEN. Engaging HOLD DOOR relay.\n");
         gpio_set_level(RELAY_DOOR_HOLD_PIN, 1);
     } else if (strcmp(command, CMD_RELEASE_DOOR) == 0) {
-        printf("[CTRL] Received CMD_RELEASE_DOOR\n");
+        printf("[CTRL] Received CMD_RELEASE_DOOR. Releasing HOLD DOOR relay.\n");
         gpio_set_level(RELAY_DOOR_HOLD_PIN, 0);
     } else if (strcmp(command, CMD_SELECT_FLOOR) == 0) {
-        printf("[CTRL] Received CMD_SELECT_FLOOR\n");
+        printf("[CTRL] Received CMD_SELECT_FLOOR. Triggering floor select relay.\n");
         pulse_select_requested = true;
     } else {
-        printf("[CTRL] Unknown command: %s\n", command);
+        printf("[CTRL] Unknown command received: %s\n", command);
     }
 }
 
@@ -117,7 +117,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
 
     relay_init();
-    printf("[CTRL] Controller online, relay pins initialized.\n");
+    printf("[CTRL] Controller online. Relays initialized and ready to receive floor board commands.\n");
 
     while (1) {
         if (pulse_call_requested) {

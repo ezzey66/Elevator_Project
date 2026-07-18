@@ -9,10 +9,14 @@
 #include "esp_now.h"
 #include "esp_netif.h"
 #include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_gap_ble_api.h"
 #include "sensor.h"
 #include "reed_switch.h"
 
-static bool ble_target_found = false;
+static TickType_t ble_last_seen_ticks = 0;
+static const bool use_specific_beacon = false;
+static const uint8_t target_ble_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
 static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 {
@@ -57,12 +61,23 @@ static bool send_espnow_command(const char *command)
 
 static bool is_ble_target_visible(void)
 {
-    // BLE scan runs continuously; check if target was detected in recent scan
-    if (ble_target_found) {
-        ble_target_found = false;  // Reset flag for next scan
+    if (ble_last_seen_ticks == 0) {
+        return false;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if ((now - ble_last_seen_ticks) <= pdMS_TO_TICKS(500)) {
         return true;
     }
     return false;
+}
+
+static bool is_target_ble_address(const uint8_t *addr)
+{
+    if (!use_specific_beacon) {
+        return true;
+    }
+    return (memcmp(addr, target_ble_mac, sizeof(target_ble_mac)) == 0);
 }
 
 static bool is_object_close(void)
@@ -89,9 +104,59 @@ static void init_sensor_pins(void)
 
 static void ble_scan_start(void)
 {
-    // BLE controller is enabled, scanning can run
-    // Note: Full GAP stack scan not configured; placeholder for BLE initialization
-    printf("[BLE] BLE controller initialized and ready for scanning\n");
+    esp_ble_scan_params_t scan_params = {
+        .scan_type = BLE_SCAN_TYPE_PASSIVE,
+        .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+        .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
+        .scan_interval = 0x50,
+        .scan_window = 0x30,
+        .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE,
+    };
+
+    esp_err_t err = esp_ble_gap_set_scan_params(&scan_params);
+    if (err != ESP_OK) {
+        printf("[BLE] Failed to set scan params: %d\n", err);
+    } else {
+        printf("[BLE] Requested BLE scan parameters.\n");
+    }
+}
+
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
+{
+    switch (event) {
+        case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
+            if (param->scan_param_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+                esp_ble_gap_start_scanning(0);
+                printf("[BLE] Started BLE scanning.\n");
+            } else {
+                printf("[BLE] Scan parameter set failed, status=%d\n", param->scan_param_cmpl.status);
+            }
+            break;
+
+        case ESP_GAP_BLE_SCAN_START_COMPLETE_EVT:
+            if (param->scan_start_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+                printf("[BLE] Scan start complete.\n");
+            } else {
+                printf("[BLE] Scan start failed, status=%d\n", param->scan_start_cmpl.status);
+            }
+            break;
+
+        case ESP_GAP_BLE_SCAN_RESULT_EVT:
+            if (param->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
+                if (is_target_ble_address(param->scan_rst.bda) && param->scan_rst.rssi > -80) {
+                    ble_last_seen_ticks = xTaskGetTickCount();
+                    printf("[BLE] Beacon detected, RSSI=%d\n", param->scan_rst.rssi);
+                }
+            }
+            break;
+
+        case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
+            printf("[BLE] Scan stopped.\n");
+            break;
+
+        default:
+            break;
+    }
 }
 
 void app_main(void)
@@ -123,31 +188,25 @@ void app_main(void)
 
     init_sensor_pins();
     
-    // Initialize BLE (minimal configuration)
+    // Initialize BLE stack for beacon scanning
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
-    
-    // Start initial BLE scan
+    ESP_ERROR_CHECK(esp_bluedroid_init());
+    ESP_ERROR_CHECK(esp_bluedroid_enable());
+    ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_event_handler));
+
     ble_scan_start();
-    printf("[FSM] Board 2 started. Waiting for BLE verification and sensors.\n");
+    printf("[FSM] esp32_2 initialized. Waiting for BLE beacon and sensors.\n");
 
     elevator_state_t state = STATE_SEARCHING_BLE;
     uint32_t ble_seen_ms = 0;
     uint32_t distance_confirm_ms = 0;
     uint32_t door_close_wait_ms = 0;
-    uint32_t ble_scan_restart_ms = 0;
     bool release_sent = false;
 
     while (1) {
-        // Periodically restart BLE scan every 6 seconds
-        ble_scan_restart_ms += FSM_TICK_MS;
-        if (ble_scan_restart_ms >= 6000) {
-            ble_scan_start();
-            ble_scan_restart_ms = 0;
-        }
-        
         bool target_seen = is_ble_target_visible();
         bool object_close = is_object_close();
         bool door_sealed = is_door_sealed();
@@ -158,13 +217,13 @@ void app_main(void)
                 if (target_seen) {
                     ble_seen_ms += FSM_TICK_MS;
                     if (ble_seen_ms >= BLE_CONFIRM_MS) {
-                        printf("[FSM] BLE target continuously seen for 10s. Transition to VERIFY_DISTANCE.\n");
+                        printf("[FLOW] BLE beacon confirmed for 10s. Proceeding to robot detection.\n");
                         state = STATE_VERIFY_DISTANCE;
                         distance_confirm_ms = 0;
                     }
                 } else {
                     if (ble_seen_ms > 0) {
-                        printf("[FSM] BLE target lost before confirmation. Resetting search.\n");
+                        printf("[FLOW] BLE signal lost, continuing search.\n");
                     }
                     ble_seen_ms = 0;
                 }
@@ -174,12 +233,12 @@ void app_main(void)
                 if (object_close) {
                     distance_confirm_ms += FSM_TICK_MS;
                     if (distance_confirm_ms >= DISTANCE_CONFIRM_MS) {
-                        printf("[FSM] Distance verified for 5s. Sending CMD_CALL_ELEVATOR.\n");
+                        printf("[FLOW] Robot presence confirmed for 5s. Sending CALL ELEVATOR.\n");
                         send_espnow_command(CMD_CALL_ELEVATOR);
                         state = STATE_WAIT_FOR_DOOR;
                     }
                 } else {
-                    printf("[FSM] Object lost during distance verification. Returning to SEARCHING_BLE.\n");
+                    printf("[FLOW] Robot left before confirmation. Returning to BLE search.\n");
                     state = STATE_SEARCHING_BLE;
                     ble_seen_ms = 0;
                     distance_confirm_ms = 0;
@@ -188,7 +247,7 @@ void app_main(void)
 
             case STATE_WAIT_FOR_DOOR:
                 if (!door_sealed) {
-                    printf("[FSM] Door opened. Sending CMD_HOLD_DOOR_OPEN.\n");
+                    printf("[FLOW] Door opened by controller. Sending HOLD DOOR OPEN command.\n");
                     send_espnow_command(CMD_HOLD_DOOR_OPEN);
                     state = STATE_HOLD_DOOR_OPEN;
                     release_sent = false;
@@ -197,7 +256,7 @@ void app_main(void)
 
             case STATE_HOLD_DOOR_OPEN:
                 if (path_clear) {
-                    printf("[FSM] Path clear detected. Sending CMD_RELEASE_DOOR and moving to SELECT_FLOOR.\n");
+                    printf("[FLOW] Path clear confirmed. Sending RELEASE DOOR and moving to SELECT_FLOOR.\n");
                     send_espnow_command(CMD_RELEASE_DOOR);
                     state = STATE_SELECT_FLOOR;
                     door_close_wait_ms = 0;
@@ -207,7 +266,7 @@ void app_main(void)
 
             case STATE_SELECT_FLOOR:
                 if (door_sealed) {
-                    printf("[FSM] Door sealed safely. Sending CMD_SELECT_FLOOR and resetting FSM.\n");
+                    printf("[FLOW] Door sealed after release. Sending SELECT FLOOR and resetting flow.\n");
                     send_espnow_command(CMD_SELECT_FLOOR);
                     state = STATE_SEARCHING_BLE;
                     ble_seen_ms = 0;
@@ -216,7 +275,7 @@ void app_main(void)
                 } else {
                     door_close_wait_ms += FSM_TICK_MS;
                     if (door_close_wait_ms >= DOOR_CLOSE_TIMEOUT_MS) {
-                        printf("[FSM] Door did not seal within 12s. Transition to ERROR_STUCK.\n");
+                        printf("[ERROR] Door failed to reseal within 12s. Entering ERROR_STUCK.\n");
                         state = STATE_ERROR_STUCK;
                     }
                 }
