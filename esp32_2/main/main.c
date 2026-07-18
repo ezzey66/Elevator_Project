@@ -197,17 +197,19 @@ void app_main(void)
     } else {
         printf("[INFO] BLE disabled; only sensor outputs will be shown.\n");
     }
-    printf("[FSM] esp32_2 initialized. Waiting for BLE beacon and sensors.\n");
+    printf("[FLOW] esp32_2 initialized. Starting sensor-only flow.\n");
 
-    elevator_state_t state = STATE_SEARCHING_BLE;
+    elevator_state_t state = STATE_VERIFY_DISTANCE;
     uint32_t ble_seen_ms = 0;
     uint32_t distance_confirm_ms = 0;
     uint32_t door_close_wait_ms = 0;
-    uint32_t sensor_heartbeat_ms = 0;
     bool release_sent = false;
 
     while (1) {
-        bool target_seen = is_ble_target_visible();
+        bool target_seen = false;
+        if (enable_ble) {
+            target_seen = is_ble_target_visible();
+        }
         bool object_close = is_object_close();
         bool door_sealed = is_door_sealed();
         bool path_clear = is_path_clear();
@@ -215,21 +217,34 @@ void app_main(void)
         if (object_close != last_object_close) {
             if (object_close) {
                 printf("[SENSOR] Distance detected: object_close=1\n");
+            } else {
+                printf("[SENSOR] Distance cleared: object_close=0\n");
             }
             last_object_close = object_close;
         }
         if (path_clear != last_path_clear) {
+            if (path_clear) {
+                printf("[SENSOR] Path clear: path_clear=1\n");
+            } else {
+                printf("[SENSOR] Path blocked: path_clear=0\n");
+            }
             last_path_clear = path_clear;
         }
         if (door_sealed != last_door_sealed) {
             if (door_sealed) {
                 printf("[SENSOR] Reed activated: door_sealed=1\n");
+            } else {
+                printf("[SENSOR] Reed opened: door_sealed=0\n");
             }
             last_door_sealed = door_sealed;
         }
 
         switch (state) {
             case STATE_SEARCHING_BLE:
+                if (!enable_ble) {
+                    state = STATE_VERIFY_DISTANCE;
+                    break;
+                }
                 if (target_seen) {
                     ble_seen_ms += FSM_TICK_MS;
                     if (ble_seen_ms >= BLE_CONFIRM_MS) {
@@ -254,9 +269,6 @@ void app_main(void)
                         state = STATE_WAIT_FOR_DOOR;
                     }
                 } else {
-                    printf("[FLOW] Robot left before confirmation. Returning to BLE search.\n");
-                    state = STATE_SEARCHING_BLE;
-                    ble_seen_ms = 0;
                     distance_confirm_ms = 0;
                 }
                 break;
@@ -284,8 +296,7 @@ void app_main(void)
                 if (door_sealed) {
                     printf("[FLOW] Door sealed after release. Sending SELECT FLOOR and resetting flow.\n");
                     send_espnow_command(CMD_SELECT_FLOOR);
-                    state = STATE_SEARCHING_BLE;
-                    ble_seen_ms = 0;
+                    state = STATE_VERIFY_DISTANCE;
                     distance_confirm_ms = 0;
                     door_close_wait_ms = 0;
                 } else {
