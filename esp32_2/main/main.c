@@ -20,15 +20,16 @@ static TickType_t ble_last_seen_ticks = 0;
 static int8_t last_ble_rssi = -127;
 typedef enum { BLE_PROX_UNKNOWN = 0, BLE_PROX_CLOSE, BLE_PROX_FAR } ble_proximity_t;
 static ble_proximity_t ble_prox = BLE_PROX_FAR;
-static int ble_close_streak = 0;
-static int ble_far_streak = 0;
 static const bool use_specific_beacon = false;
+
+/* BLE state is decided by direct RSSI thresholds and hold time */
+
 static const uint8_t target_ble_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 static bool last_object_close = false;
 static bool last_path_clear = false;
 static bool last_door_sealed = false;
-static bool ble_prints_enabled = false; // set to true to re-enable BLE prints
-static bool enable_ble = true; // enabled now so BLE robot location is used
+static bool ble_prints_enabled = true; // set to true to re-enable BLE prints
+static bool enable_ble = false; // enabled now so BLE robot location is used
 
 typedef enum {
     ROBOT_FAR,
@@ -49,10 +50,9 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 
 #define FSM_TICK_MS            100
 #define BLE_CONFIRM_MS         10000
-#define BLE_CLOSE_RSSI         -80
+#define BLE_CLOSE_RSSI         -85
 #define BLE_FAR_RSSI           -90
-#define BLE_HOLD_MS            3000
-#define BLE_STREAK_REQUIRED    3
+#define BLE_HOLD_MS            5000
 #define BLE_VISIBILITY_TIMEOUT_MS 1000
 #define DISTANCE_CONFIRM_MS    5000
 #define DOOR_CLOSE_TIMEOUT_MS  12000
@@ -176,29 +176,22 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                 if (is_target_ble_address(param->scan_rst.bda)) {
                     last_ble_rssi = param->scan_rst.rssi;
                     ble_last_seen_ticks = xTaskGetTickCount();
+                    int8_t rssi = last_ble_rssi;
                     if (ble_prints_enabled) {
-                        printf("[BLE] Beacon rssi=%d\n", param->scan_rst.rssi);
+                        printf("[BLE] rssi=%d\n", rssi);
                     }
-                    /* Use streak counters to avoid toggling on noisy RSSI readings. */
-                    if (last_ble_rssi >= BLE_CLOSE_RSSI) {
-                        ble_close_streak++;
-                        ble_far_streak = 0;
-                    } else if (last_ble_rssi <= BLE_FAR_RSSI) {
-                        ble_far_streak++;
-                        ble_close_streak = 0;
-                    } else {
-                        if (ble_close_streak > 0) ble_close_streak--;
-                        if (ble_far_streak > 0) ble_far_streak--;
+                    if (rssi <= BLE_FAR_RSSI) {
+                        if (ble_prox != BLE_PROX_FAR) {
+                            ble_prox = BLE_PROX_FAR;
+                            if (ble_prints_enabled) printf("[BLE] Prox => FAR (rssi=%d)\n", rssi);
+                        }
+                    } else if (rssi >= BLE_CLOSE_RSSI) {
+                        if (ble_prox != BLE_PROX_CLOSE) {
+                            ble_prox = BLE_PROX_CLOSE;
+                            if (ble_prints_enabled) printf("[BLE] Prox => CLOSE (rssi=%d)\n", rssi);
+                        }
                     }
 
-                    if (ble_close_streak >= BLE_STREAK_REQUIRED && ble_prox != BLE_PROX_CLOSE) {
-                        ble_prox = BLE_PROX_CLOSE;
-                        if (ble_prints_enabled) printf("[BLE] Prox => CLOSE (rssi=%d)\n", last_ble_rssi);
-                    }
-                    if (ble_far_streak >= BLE_STREAK_REQUIRED && ble_prox != BLE_PROX_FAR) {
-                        ble_prox = BLE_PROX_FAR;
-                        if (ble_prints_enabled) printf("[BLE] Prox => FAR (rssi=%d)\n", last_ble_rssi);
-                    }
                 }
             }
             break;
@@ -270,6 +263,8 @@ void app_main(void)
     uint32_t distance_confirm_ms = 0;
     uint32_t door_close_wait_ms = 0;
     bool release_sent = false;
+
+    printf("[FLOW] State changed: ROBOT_FAR\n");
 
     while (1) {
         bool object_close = is_object_close();
