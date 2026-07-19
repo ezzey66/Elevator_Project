@@ -1,6 +1,7 @@
 ﻿#include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -16,6 +17,11 @@
 #include "esp_log.h"
 
 static TickType_t ble_last_seen_ticks = 0;
+static int8_t last_ble_rssi = -127;
+typedef enum { BLE_PROX_UNKNOWN = 0, BLE_PROX_CLOSE, BLE_PROX_FAR } ble_proximity_t;
+static ble_proximity_t ble_prox = BLE_PROX_FAR;
+static int ble_close_streak = 0;
+static int ble_far_streak = 0;
 static const bool use_specific_beacon = false;
 static const uint8_t target_ble_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 static bool last_object_close = false;
@@ -43,6 +49,11 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 
 #define FSM_TICK_MS            100
 #define BLE_CONFIRM_MS         10000
+#define BLE_CLOSE_RSSI         -80
+#define BLE_FAR_RSSI           -90
+#define BLE_HOLD_MS            3000
+#define BLE_STREAK_REQUIRED    3
+#define BLE_VISIBILITY_TIMEOUT_MS 1000
 #define DISTANCE_CONFIRM_MS    5000
 #define DOOR_CLOSE_TIMEOUT_MS  12000
 
@@ -72,19 +83,6 @@ static bool send_espnow_command(const char *command)
     return true;
 }
 
-static bool is_ble_target_visible(void)
-{
-    if (ble_last_seen_ticks == 0) {
-        return false;
-    }
-
-    TickType_t now = xTaskGetTickCount();
-    if ((now - ble_last_seen_ticks) <= pdMS_TO_TICKS(500)) {
-        return true;
-    }
-    return false;
-}
-
 static bool is_target_ble_address(const uint8_t *addr)
 {
     if (!use_specific_beacon) {
@@ -92,6 +90,8 @@ static bool is_target_ble_address(const uint8_t *addr)
     }
     return (memcmp(addr, target_ble_mac, sizeof(target_ble_mac)) == 0);
 }
+
+static bool is_ble_target_visible(void);
 
 static bool is_object_close(void)
 {
@@ -116,6 +116,21 @@ static bool is_robot_far(void)
 static bool is_robot_close(void)
 {
     return is_ble_target_visible();
+}
+
+static bool is_ble_target_visible(void)
+{
+    if (ble_prox != BLE_PROX_CLOSE) {
+        return false;
+    }
+    if (ble_last_seen_ticks == 0) {
+        return false;
+    }
+    TickType_t now = xTaskGetTickCount();
+    if ((now - ble_last_seen_ticks) <= pdMS_TO_TICKS(BLE_HOLD_MS)) {
+        return true;
+    }
+    return false;
 }
 
 static void init_sensor_pins(void)
@@ -145,16 +160,49 @@ static void ble_scan_start(void)
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
     switch (event) {
+        case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
+            if (param->scan_param_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+                esp_err_t err = esp_ble_gap_start_scanning(0);
+                if (err != ESP_OK) {
+                    printf("[BLE] Failed to start scanning: %d\n", err);
+                }
+            } else {
+                printf("[BLE] Scan parameter set failed, status=%d\n", param->scan_param_cmpl.status);
+            }
+            break;
+
         case ESP_GAP_BLE_SCAN_RESULT_EVT:
             if (param->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
-                if (is_target_ble_address(param->scan_rst.bda) && param->scan_rst.rssi > -80) {
+                if (is_target_ble_address(param->scan_rst.bda)) {
+                    last_ble_rssi = param->scan_rst.rssi;
                     ble_last_seen_ticks = xTaskGetTickCount();
                     if (ble_prints_enabled) {
                         printf("[BLE] Beacon rssi=%d\n", param->scan_rst.rssi);
                     }
+                    /* Use streak counters to avoid toggling on noisy RSSI readings. */
+                    if (last_ble_rssi >= BLE_CLOSE_RSSI) {
+                        ble_close_streak++;
+                        ble_far_streak = 0;
+                    } else if (last_ble_rssi <= BLE_FAR_RSSI) {
+                        ble_far_streak++;
+                        ble_close_streak = 0;
+                    } else {
+                        if (ble_close_streak > 0) ble_close_streak--;
+                        if (ble_far_streak > 0) ble_far_streak--;
+                    }
+
+                    if (ble_close_streak >= BLE_STREAK_REQUIRED && ble_prox != BLE_PROX_CLOSE) {
+                        ble_prox = BLE_PROX_CLOSE;
+                        if (ble_prints_enabled) printf("[BLE] Prox => CLOSE (rssi=%d)\n", last_ble_rssi);
+                    }
+                    if (ble_far_streak >= BLE_STREAK_REQUIRED && ble_prox != BLE_PROX_FAR) {
+                        ble_prox = BLE_PROX_FAR;
+                        if (ble_prints_enabled) printf("[BLE] Prox => FAR (rssi=%d)\n", last_ble_rssi);
+                    }
                 }
             }
             break;
+
         default:
             break;
     }
@@ -217,19 +265,31 @@ void app_main(void)
     printf("[FLOW] esp32_2 initialized. Starting BLE+sensor elevator flow.\n");
 
     elevator_state_t state = STATE_ROBOT_FAR;
+    elevator_state_t last_state = STATE_ROBOT_FAR;
     uint32_t ble_seen_ms = 0;
     uint32_t distance_confirm_ms = 0;
     uint32_t door_close_wait_ms = 0;
     bool release_sent = false;
 
     while (1) {
-        bool target_seen = false;
-        if (enable_ble) {
-            target_seen = is_ble_target_visible();
-        }
         bool object_close = is_object_close();
         bool door_sealed = is_door_sealed();
         bool path_clear = is_path_clear();
+
+        if (state != last_state) {
+            const char *name = "UNKNOWN";
+            switch (state) {
+                case STATE_ROBOT_FAR: name = "ROBOT_FAR"; break;
+                case STATE_ROBOT_CLOSE: name = "ROBOT_CLOSE"; break;
+                case STATE_WAITING_FOR_ELEVATOR: name = "WAITING_FOR_ELEVATOR"; break;
+                case STATE_WAIT_FOR_DOOR: name = "WAIT_FOR_DOOR"; break;
+                case STATE_HOLD_DOOR_OPEN: name = "HOLD_DOOR_OPEN"; break;
+                case STATE_SELECT_FLOOR: name = "SELECT_FLOOR"; break;
+                case STATE_ERROR_STUCK: name = "ERROR_STUCK"; break;
+            }
+            printf("[FLOW] State changed: %s\n", name);
+            last_state = state;
+        }
 
         if (object_close != last_object_close) {
             if (object_close) {
@@ -258,24 +318,35 @@ void app_main(void)
 
         switch (state) {
             case STATE_ROBOT_FAR:
-                if (target_seen) {
+                if (is_robot_close()) {
+                    printf("[FLOW] Robot BLE detected nearby. Entering close state.\n");
+                    state = STATE_ROBOT_CLOSE;
+                    ble_seen_ms = 0;
+                }
+                break;
+
+            case STATE_ROBOT_CLOSE:
+                if (is_robot_far()) {
+                    printf("[FLOW] Robot BLE lost. Returning to far state.\n");
+                    state = STATE_ROBOT_FAR;
+                    ble_seen_ms = 0;
+                    break;
+                }
+                if (object_close) {
                     ble_seen_ms += FSM_TICK_MS;
                     if (ble_seen_ms >= BLE_CONFIRM_MS) {
-                        printf("[FLOW] Robot is close via BLE for 10s. Moving to waiting-for-elevator state.\n");
+                        printf("[FLOW] BLE close and distance confirmed for 10s. Entering waiting-for-elevator state.\n");
                         state = STATE_WAITING_FOR_ELEVATOR;
                         distance_confirm_ms = 0;
                     }
                 } else {
-                    if (ble_seen_ms > 0) {
-                        printf("[FLOW] BLE lost before close confirmation. Robot is still far.\n");
-                    }
                     ble_seen_ms = 0;
                 }
                 break;
 
             case STATE_WAITING_FOR_ELEVATOR:
-                if (!target_seen) {
-                    printf("[FLOW] BLE robot no longer close. Returning to far detection.\n");
+                if (is_robot_far()) {
+                    printf("[FLOW] BLE robot no longer close. Returning to far state.\n");
                     state = STATE_ROBOT_FAR;
                     ble_seen_ms = 0;
                     break;
@@ -283,7 +354,7 @@ void app_main(void)
                 if (object_close) {
                     distance_confirm_ms += FSM_TICK_MS;
                     if (distance_confirm_ms >= DISTANCE_CONFIRM_MS) {
-                        printf("[FLOW] Robot presence confirmed while BLE close. Calling elevator.\n");
+                        printf("[FLOW] Robot presence confirmed while BLE waiting. Calling elevator.\n");
                         send_espnow_command(CMD_CALL_ELEVATOR);
                         state = STATE_WAIT_FOR_DOOR;
                     }
