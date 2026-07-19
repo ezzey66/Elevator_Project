@@ -22,7 +22,13 @@ static bool last_object_close = false;
 static bool last_path_clear = false;
 static bool last_door_sealed = false;
 static bool ble_prints_enabled = false; // set to true to re-enable BLE prints
-static bool enable_ble = false; // set to true to enable BLE scanning and stack
+static bool enable_ble = true; // enabled now so BLE robot location is used
+
+typedef enum {
+    ROBOT_FAR,
+    ROBOT_CLOSE,
+    ROBOT_WAITING_FOR_ELEVATOR,
+} robot_proximity_state_t;
 
 static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 {
@@ -44,8 +50,9 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 #define SENSOR_DISTANCE_PIN    SENSOR_PIN
 
 typedef enum {
-    STATE_SEARCHING_BLE,
-    STATE_VERIFY_DISTANCE,
+    STATE_ROBOT_FAR,
+    STATE_ROBOT_CLOSE,
+    STATE_WAITING_FOR_ELEVATOR,
     STATE_WAIT_FOR_DOOR,
     STATE_HOLD_DOOR_OPEN,
     STATE_SELECT_FLOOR,
@@ -99,6 +106,16 @@ static bool is_path_clear(void)
 static bool is_door_sealed(void)
 {
     return is_magnet_present();
+}
+
+static bool is_robot_far(void)
+{
+    return !is_ble_target_visible();
+}
+
+static bool is_robot_close(void)
+{
+    return is_ble_target_visible();
 }
 
 static void init_sensor_pins(void)
@@ -197,9 +214,9 @@ void app_main(void)
     } else {
         printf("[INFO] BLE disabled; only sensor outputs will be shown.\n");
     }
-    printf("[FLOW] esp32_2 initialized. Starting sensor-only flow.\n");
+    printf("[FLOW] esp32_2 initialized. Starting BLE+sensor elevator flow.\n");
 
-    elevator_state_t state = STATE_VERIFY_DISTANCE;
+    elevator_state_t state = STATE_ROBOT_FAR;
     uint32_t ble_seen_ms = 0;
     uint32_t distance_confirm_ms = 0;
     uint32_t door_close_wait_ms = 0;
@@ -240,31 +257,33 @@ void app_main(void)
         }
 
         switch (state) {
-            case STATE_SEARCHING_BLE:
-                if (!enable_ble) {
-                    state = STATE_VERIFY_DISTANCE;
-                    break;
-                }
+            case STATE_ROBOT_FAR:
                 if (target_seen) {
                     ble_seen_ms += FSM_TICK_MS;
                     if (ble_seen_ms >= BLE_CONFIRM_MS) {
-                        printf("[FLOW] BLE beacon confirmed for 10s. Proceeding to robot detection.\n");
-                        state = STATE_VERIFY_DISTANCE;
+                        printf("[FLOW] Robot is close via BLE for 10s. Moving to waiting-for-elevator state.\n");
+                        state = STATE_WAITING_FOR_ELEVATOR;
                         distance_confirm_ms = 0;
                     }
                 } else {
                     if (ble_seen_ms > 0) {
-                        printf("[FLOW] BLE signal lost, continuing search.\n");
+                        printf("[FLOW] BLE lost before close confirmation. Robot is still far.\n");
                     }
                     ble_seen_ms = 0;
                 }
                 break;
 
-            case STATE_VERIFY_DISTANCE:
+            case STATE_WAITING_FOR_ELEVATOR:
+                if (!target_seen) {
+                    printf("[FLOW] BLE robot no longer close. Returning to far detection.\n");
+                    state = STATE_ROBOT_FAR;
+                    ble_seen_ms = 0;
+                    break;
+                }
                 if (object_close) {
                     distance_confirm_ms += FSM_TICK_MS;
                     if (distance_confirm_ms >= DISTANCE_CONFIRM_MS) {
-                        printf("[FLOW] Robot presence confirmed for 5s. Sending CALL ELEVATOR.\n");
+                        printf("[FLOW] Robot presence confirmed while BLE close. Calling elevator.\n");
                         send_espnow_command(CMD_CALL_ELEVATOR);
                         state = STATE_WAIT_FOR_DOOR;
                     }
@@ -296,8 +315,9 @@ void app_main(void)
                 if (door_sealed) {
                     printf("[FLOW] Door sealed after release. Sending SELECT FLOOR and resetting flow.\n");
                     send_espnow_command(CMD_SELECT_FLOOR);
-                    state = STATE_VERIFY_DISTANCE;
+                    state = STATE_ROBOT_FAR;
                     distance_confirm_ms = 0;
+                    ble_seen_ms = 0;
                     door_close_wait_ms = 0;
                 } else {
                     door_close_wait_ms += FSM_TICK_MS;
