@@ -12,6 +12,7 @@
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_gap_ble_api.h"
+#include "esp_mac.h"
 #include "sensor.h"
 #include "reed_switch.h"
 #include "esp_log.h"
@@ -32,6 +33,8 @@ static ble_proximity_t ble_prox = BLE_PROX_FAR;
 static const bool use_specific_beacon = false;
 
 static const uint8_t target_ble_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+static uint8_t learned_ble_mac[6] = {0};
+static bool has_learned_ble_mac = false;
 static bool last_object_close = false;
 
 // BLE proximity logic follows the elevator flowchart:
@@ -49,7 +52,7 @@ static const size_t peer_count = sizeof(peer_macs) / sizeof(peer_macs[0]);
 static uint8_t own_mac[6] = {0};
 static bool last_path_clear = false;
 static bool last_door_sealed = false;
-static bool ble_prints_enabled = true; // set to true to re-enable BLE prints
+static bool ble_prints_enabled = false; // set to true to re-enable BLE prints
 static bool enable_ble = true; // BLE must be enabled so beacon proximity can drive the flow
 
 typedef enum {
@@ -65,18 +68,27 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 }
 
 // ESP-NOW commands sent to the controller board.
-#define CMD_CALL_ELEVATOR      "CMD_CALL_ELEVATOR"
+#define CMD_SERVICE_MODE_ON    "CMD_SERVICE_MODE_ON"
+#define CMD_SERVICE_MODE_OFF   "CMD_SERVICE_MODE_OFF"
+#define CMD_CALL_FLOOR_1       "CMD_CALL_FLOOR_1"
+#define CMD_CALL_FLOOR_2       "CMD_CALL_FLOOR_2"
 #define CMD_HOLD_DOOR_OPEN     "CMD_HOLD_DOOR_OPEN"
 #define CMD_RELEASE_DOOR       "CMD_RELEASE_DOOR"
-#define CMD_SELECT_FLOOR       "CMD_SELECT_FLOOR"
 #define CMD_ROBOT_READY        "CMD_ROBOT_READY"
 
 #define FSM_TICK_MS            100
 #define BLE_CONFIRM_MS         10000
 #define BLE_ENTER_RSSI         -68
 #define BLE_EXIT_RSSI          -78
+#define BLE_MAX_STABLE_STDDEV  4.0f
+#define BLE_CLOSE_CONFIRM_SAMPLES 6
+#define BLE_FAR_CONFIRM_SAMPLES   12
 #define DISTANCE_CONFIRM_MS    5000
+#define ENTRY_DOOR_HOLD_AFTER_DETECT_MS 5000
+#define EXIT_DOOR_HOLD_AFTER_CLEAR_MS   5000
+#define DOOR_OPEN_TIMEOUT_MS   30000
 #define DOOR_CLOSE_TIMEOUT_MS  12000
+#define ROBOT_START_FLOOR      1
 
 #define SENSOR_REED_PIN        REED_PIN
 #define SENSOR_DISTANCE_PIN    SENSOR_PIN
@@ -84,14 +96,18 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 typedef enum {
     STATE_ROBOT_FAR,
     STATE_ROBOT_CLOSE,
-    STATE_WAITING_FOR_ELEVATOR,
-    STATE_WAIT_FOR_DOOR,
-    STATE_HOLD_DOOR_OPEN,
-    STATE_SELECT_FLOOR,
+    STATE_CONFIRM_DISTANCE,
+    STATE_CALL_ORIGIN_FLOOR,
+    STATE_WAIT_ENTRY_DOOR_OPEN,
+    STATE_WAIT_ROBOT_ENTERED,
+    STATE_WAIT_ENTRY_DOOR_CLOSED,
+    STATE_CALL_DESTINATION_FLOOR,
+    STATE_WAIT_EXIT_DOOR_OPEN,
+    STATE_WAIT_ROBOT_EXIT_DETECTED,
+    STATE_WAIT_ROBOT_EXIT_CLEAR,
+    STATE_FINISHED,
     STATE_ERROR_STUCK,
 } elevator_state_t;
-
-static const uint8_t own_mac_prefix[3] = {0x30, 0x76, 0xF5};
 
 static void print_mac(const uint8_t *mac)
 {
@@ -138,12 +154,34 @@ static bool send_espnow_command(const char *command)
     return true;
 }
 
-static bool is_target_ble_address(const uint8_t *addr)
+static uint8_t other_floor(uint8_t floor)
 {
-    if (!use_specific_beacon) {
-        return true;
+    return (floor == 1) ? 2 : 1;
+}
+
+static const char *floor_command(uint8_t floor)
+{
+    return (floor == 1) ? CMD_CALL_FLOOR_1 : CMD_CALL_FLOOR_2;
+}
+
+static bool should_use_ble_advertisement(const uint8_t *addr, int8_t rssi)
+{
+    if (use_specific_beacon) {
+        return (memcmp(addr, target_ble_mac, sizeof(target_ble_mac)) == 0);
     }
-    return (memcmp(addr, target_ble_mac, sizeof(target_ble_mac)) == 0);
+
+    if (!has_learned_ble_mac) {
+        if (rssi < BLE_ENTER_RSSI) {
+            return false;
+        }
+        memcpy(learned_ble_mac, addr, sizeof(learned_ble_mac));
+        has_learned_ble_mac = true;
+        printf("[BLE] Learned beacon MAC: ");
+        print_mac(learned_ble_mac);
+        printf(" (rssi=%d)\n", rssi);
+    }
+
+    return (memcmp(addr, learned_ble_mac, sizeof(learned_ble_mac)) == 0);
 }
 
 static bool is_object_close(void)
@@ -196,6 +234,52 @@ static bool is_robot_close(void)
         return is_object_close();
     }
     return (ble_prox == BLE_PROX_CLOSE);
+}
+
+static void update_ble_proximity(float rssi, float stddev)
+{
+    static uint8_t close_candidate_count = 0;
+    static uint8_t far_candidate_count = 0;
+
+    if (filtered_rssi_sample_count < BLE_RSSI_STABILITY_WINDOW ||
+        stddev > BLE_MAX_STABLE_STDDEV) {
+        close_candidate_count = 0;
+        far_candidate_count = 0;
+        return;
+    }
+
+    if (rssi >= BLE_ENTER_RSSI) {
+        if (close_candidate_count < BLE_CLOSE_CONFIRM_SAMPLES) {
+            close_candidate_count++;
+        }
+        far_candidate_count = 0;
+    } else if (rssi <= BLE_EXIT_RSSI) {
+        if (far_candidate_count < BLE_FAR_CONFIRM_SAMPLES) {
+            far_candidate_count++;
+        }
+        close_candidate_count = 0;
+    } else {
+        close_candidate_count = 0;
+        far_candidate_count = 0;
+    }
+
+    if (ble_prox != BLE_PROX_CLOSE &&
+        close_candidate_count >= BLE_CLOSE_CONFIRM_SAMPLES) {
+        ble_prox = BLE_PROX_CLOSE;
+        close_candidate_count = 0;
+        far_candidate_count = 0;
+        if (ble_prints_enabled) {
+            printf("[BLE] Prox => CLOSE (filtered_rssi=%.1f, stddev=%.2f)\n", rssi, stddev);
+        }
+    } else if (ble_prox != BLE_PROX_FAR &&
+               far_candidate_count >= BLE_FAR_CONFIRM_SAMPLES) {
+        ble_prox = BLE_PROX_FAR;
+        close_candidate_count = 0;
+        far_candidate_count = 0;
+        if (ble_prints_enabled) {
+            printf("[BLE] Prox => FAR (filtered_rssi=%.1f, stddev=%.2f)\n", rssi, stddev);
+        }
+    }
 }
 
 static void init_sensor_pins(void)
@@ -260,7 +344,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 
         case ESP_GAP_BLE_SCAN_RESULT_EVT:
             if (param->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
-                if (is_target_ble_address(param->scan_rst.bda)) {
+                if (should_use_ble_advertisement(param->scan_rst.bda, param->scan_rst.rssi)) {
                     last_ble_rssi = param->scan_rst.rssi;
                     int8_t current_rssi = last_ble_rssi;
                     if (!ble_rssi_filter_initialized) {
@@ -273,19 +357,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                     float mean_rssi;
                     float stddev_rssi;
                     update_rssi_stability(filtered_ble_rssi, &mean_rssi, &stddev_rssi);
-                    // Use a two-threshold approach so the flow only enters ROBOT_CLOSE when the
-                    // beacon is clearly near, and only returns to ROBOT_FAR on an explicit far signal.
-                    if (stddev_rssi < 2.0f && filtered_ble_rssi >= BLE_ENTER_RSSI) {
-                        if (ble_prox != BLE_PROX_CLOSE) {
-                            ble_prox = BLE_PROX_CLOSE;
-                            if (ble_prints_enabled) printf("[BLE] Prox => CLOSE (filtered_rssi=%.1f)\n", filtered_ble_rssi);
-                        }
-                    } else if (stddev_rssi < 2.0f && filtered_ble_rssi <= BLE_EXIT_RSSI) {
-                        if (ble_prox != BLE_PROX_FAR) {
-                            ble_prox = BLE_PROX_FAR;
-                            if (ble_prints_enabled) printf("[BLE] Prox => FAR (filtered_rssi=%.1f)\n", filtered_ble_rssi);
-                        }
-                    }
+                    update_ble_proximity(filtered_ble_rssi, stddev_rssi);
 
                     if (ble_prints_enabled) {
                         const char *ble_state = ble_prox == BLE_PROX_CLOSE ? "CLOSE" :
@@ -344,7 +416,7 @@ void app_main(void)
     }
 
     // Send a startup handshake so the controller knows ESP-NOW is ready.
-    send_espnow_command("CMD_ROBOT_READY");
+    send_espnow_command(CMD_ROBOT_READY);
 
     init_sensor_pins();
     {
@@ -372,9 +444,15 @@ void app_main(void)
 
     elevator_state_t state = STATE_ROBOT_FAR;
     elevator_state_t last_state = STATE_ROBOT_FAR;
+    uint8_t current_floor = ROBOT_START_FLOOR;
+    uint8_t destination_floor = other_floor(current_floor);
+    uint32_t door_open_wait_ms = 0;
     uint32_t distance_confirm_ms = 0;
+    uint32_t entry_door_hold_ms = 0;
+    uint32_t exit_clear_hold_ms = 0;
     uint32_t door_close_wait_ms = 0;
-    bool release_sent = false;
+    bool entry_robot_seen = false;
+    bool exit_clear_timer_started = false;
 
     printf("[FLOW] State changed: ROBOT_FAR\n");
 
@@ -388,10 +466,16 @@ void app_main(void)
             switch (state) {
                 case STATE_ROBOT_FAR: name = "ROBOT_FAR"; break;
                 case STATE_ROBOT_CLOSE: name = "ROBOT_CLOSE"; break;
-                case STATE_WAITING_FOR_ELEVATOR: name = "WAITING_FOR_ELEVATOR"; break;
-                case STATE_WAIT_FOR_DOOR: name = "WAIT_FOR_DOOR"; break;
-                case STATE_HOLD_DOOR_OPEN: name = "HOLD_DOOR_OPEN"; break;
-                case STATE_SELECT_FLOOR: name = "SELECT_FLOOR"; break;
+                case STATE_CONFIRM_DISTANCE: name = "CONFIRM_DISTANCE"; break;
+                case STATE_CALL_ORIGIN_FLOOR: name = "CALL_ORIGIN_FLOOR"; break;
+                case STATE_WAIT_ENTRY_DOOR_OPEN: name = "WAIT_ENTRY_DOOR_OPEN"; break;
+                case STATE_WAIT_ROBOT_ENTERED: name = "WAIT_ROBOT_ENTERED"; break;
+                case STATE_WAIT_ENTRY_DOOR_CLOSED: name = "WAIT_ENTRY_DOOR_CLOSED"; break;
+                case STATE_CALL_DESTINATION_FLOOR: name = "CALL_DESTINATION_FLOOR"; break;
+                case STATE_WAIT_EXIT_DOOR_OPEN: name = "WAIT_EXIT_DOOR_OPEN"; break;
+                case STATE_WAIT_ROBOT_EXIT_DETECTED: name = "WAIT_ROBOT_EXIT_DETECTED"; break;
+                case STATE_WAIT_ROBOT_EXIT_CLEAR: name = "WAIT_ROBOT_EXIT_CLEAR"; break;
+                case STATE_FINISHED: name = "FINISHED"; break;
                 case STATE_ERROR_STUCK: name = "ERROR_STUCK"; break;
             }
             printf("[FLOW] State changed: %s\n", name);
@@ -426,9 +510,10 @@ void app_main(void)
         switch (state) {
             case STATE_ROBOT_FAR:
                 if (is_robot_close()) {
-                    printf("[FLOW] Robot BLE detected nearby. Entering close state.\n");
+                    printf("[FLOW] Robot BLE detected nearby. Confirming for %d ms.\n", BLE_CONFIRM_MS);
                     state = STATE_ROBOT_CLOSE;
                     ble_seen_ms = 0;
+                    distance_confirm_ms = 0;
                 }
                 break;
 
@@ -439,79 +524,188 @@ void app_main(void)
                     ble_seen_ms = 0;
                     break;
                 }
-                if (object_close) {
-                    ble_seen_ms += FSM_TICK_MS;
-                    if (ble_seen_ms >= BLE_CONFIRM_MS) {
-                        printf("[FLOW] BLE close and distance confirmed for 10s. Entering waiting-for-elevator state.\n");
-                        state = STATE_WAITING_FOR_ELEVATOR;
-                        distance_confirm_ms = 0;
-                    }
-                } else {
-                    ble_seen_ms = 0;
+                ble_seen_ms += FSM_TICK_MS;
+                if (ble_seen_ms >= BLE_CONFIRM_MS) {
+                    printf("[FLOW] BLE close confirmed. Waiting for distance sensor confirmation.\n");
+                    state = STATE_CONFIRM_DISTANCE;
+                    distance_confirm_ms = 0;
                 }
                 break;
 
-            case STATE_WAITING_FOR_ELEVATOR:
+            case STATE_CONFIRM_DISTANCE:
                 if (is_robot_far()) {
                     printf("[FLOW] BLE robot no longer close. Returning to far state.\n");
                     state = STATE_ROBOT_FAR;
                     ble_seen_ms = 0;
+                    distance_confirm_ms = 0;
                     break;
                 }
                 if (object_close) {
                     distance_confirm_ms += FSM_TICK_MS;
                     if (distance_confirm_ms >= DISTANCE_CONFIRM_MS) {
-                        printf("[FLOW] Robot presence confirmed while BLE waiting. Calling elevator.\n");
-                        send_espnow_command(CMD_CALL_ELEVATOR);
-                        state = STATE_WAIT_FOR_DOOR;
+                        current_floor = ROBOT_START_FLOOR;
+                        destination_floor = other_floor(current_floor);
+                        printf("[FLOW] Distance confirmed. Enabling service mode and calling floor %u.\n", current_floor);
+                        send_espnow_command(CMD_SERVICE_MODE_ON);
+                        send_espnow_command(floor_command(current_floor));
+                        state = STATE_WAIT_ENTRY_DOOR_OPEN;
+                        door_open_wait_ms = 0;
                     }
                 } else {
                     distance_confirm_ms = 0;
                 }
                 break;
 
-            case STATE_WAIT_FOR_DOOR:
+            case STATE_CALL_ORIGIN_FLOOR:
+                send_espnow_command(floor_command(current_floor));
+                state = STATE_WAIT_ENTRY_DOOR_OPEN;
+                door_open_wait_ms = 0;
+                break;
+
+            case STATE_WAIT_ENTRY_DOOR_OPEN:
                 if (!door_sealed) {
-                    printf("[FLOW] Door opened detected by robot. Sending HOLD DOOR OPEN command.\n");
+                    printf("[FLOW] Entry door opened. Holding door open while robot enters.\n");
                     send_espnow_command(CMD_HOLD_DOOR_OPEN);
-                    state = STATE_HOLD_DOOR_OPEN;
-                    release_sent = false;
-                }
-                break;
-
-            case STATE_HOLD_DOOR_OPEN:
-                if (path_clear) {
-                    printf("[FLOW] Path clear confirmed. Sending RELEASE DOOR and moving to SELECT_FLOOR.\n");
-                    send_espnow_command(CMD_RELEASE_DOOR);
-                    state = STATE_SELECT_FLOOR;
-                    door_close_wait_ms = 0;
-                    release_sent = true;
-                }
-                break;
-
-            case STATE_SELECT_FLOOR:
-                if (door_sealed) {
-                    printf("[FLOW] Door resealed on robot side. Sending SELECT FLOOR and resetting flow.\n");
-                    send_espnow_command(CMD_SELECT_FLOOR);
-                    state = STATE_ROBOT_FAR;
-                    distance_confirm_ms = 0;
-                    ble_seen_ms = 0;
-                    door_close_wait_ms = 0;
+                    state = STATE_WAIT_ROBOT_ENTERED;
+                    door_open_wait_ms = 0;
+                    entry_door_hold_ms = 0;
+                    entry_robot_seen = false;
                 } else {
-                    door_close_wait_ms += FSM_TICK_MS;
-                    if (door_close_wait_ms >= DOOR_CLOSE_TIMEOUT_MS) {
-                        printf("[ERROR] Door failed to reseal within 12s. Entering ERROR_STUCK.\n");
+                    door_open_wait_ms += FSM_TICK_MS;
+                    if (door_open_wait_ms >= DOOR_OPEN_TIMEOUT_MS) {
+                        printf("[ERROR] Door did not open at origin within timeout.\n");
                         state = STATE_ERROR_STUCK;
                     }
                 }
                 break;
 
-            case STATE_ERROR_STUCK:
-                if (!release_sent) {
-                    printf("[FSM] ERROR_STUCK: sending CMD_RELEASE_DOOR for safety.\n");
-                    send_espnow_command(CMD_RELEASE_DOOR);
-                    release_sent = true;
+            case STATE_WAIT_ROBOT_ENTERED:
+                if (object_close && !entry_robot_seen) {
+                    printf("[FLOW] Robot detected entering. Holding door for at least %d ms.\n",
+                           ENTRY_DOOR_HOLD_AFTER_DETECT_MS);
+                    entry_robot_seen = true;
+                    entry_door_hold_ms = 0;
                 }
+
+                if (entry_robot_seen && entry_door_hold_ms < ENTRY_DOOR_HOLD_AFTER_DETECT_MS) {
+                    entry_door_hold_ms += FSM_TICK_MS;
+                }
+
+                if (entry_robot_seen &&
+                    entry_door_hold_ms >= ENTRY_DOOR_HOLD_AFTER_DETECT_MS &&
+                    path_clear) {
+                    printf("[FLOW] Robot entered and hold delay elapsed. Releasing door hold so entry door can close.\n");
+                    send_espnow_command(CMD_RELEASE_DOOR);
+                    state = STATE_WAIT_ENTRY_DOOR_CLOSED;
+                    door_close_wait_ms = 0;
+                    entry_door_hold_ms = 0;
+                }
+                break;
+
+            case STATE_WAIT_ENTRY_DOOR_CLOSED:
+                if (door_sealed) {
+                    printf("[FLOW] Entry door closed. Calling destination floor %u.\n", destination_floor);
+                    state = STATE_CALL_DESTINATION_FLOOR;
+                    door_close_wait_ms = 0;
+                } else {
+                    door_close_wait_ms += FSM_TICK_MS;
+                    if (door_close_wait_ms >= DOOR_CLOSE_TIMEOUT_MS) {
+                        printf("[ERROR] Entry door failed to close within timeout.\n");
+                        state = STATE_ERROR_STUCK;
+                    }
+                }
+                break;
+
+            case STATE_CALL_DESTINATION_FLOOR:
+                send_espnow_command(floor_command(destination_floor));
+                state = STATE_WAIT_EXIT_DOOR_OPEN;
+                door_open_wait_ms = 0;
+                break;
+
+            case STATE_WAIT_EXIT_DOOR_OPEN:
+                if (!door_sealed) {
+                    printf("[FLOW] Exit door opened. Holding door open while robot exits.\n");
+                    send_espnow_command(CMD_HOLD_DOOR_OPEN);
+                    state = STATE_WAIT_ROBOT_EXIT_DETECTED;
+                    door_open_wait_ms = 0;
+                    exit_clear_hold_ms = 0;
+                    exit_clear_timer_started = false;
+                } else {
+                    door_open_wait_ms += FSM_TICK_MS;
+                    if (door_open_wait_ms >= DOOR_OPEN_TIMEOUT_MS) {
+                        printf("[ERROR] Door did not open at destination within timeout.\n");
+                        state = STATE_ERROR_STUCK;
+                    }
+                }
+                break;
+
+            case STATE_WAIT_ROBOT_EXIT_DETECTED:
+                if (object_close) {
+                    printf("[FLOW] Robot detected outside elevator. Waiting until path clears.\n");
+                    state = STATE_WAIT_ROBOT_EXIT_CLEAR;
+                }
+                break;
+
+            case STATE_WAIT_ROBOT_EXIT_CLEAR:
+                if (path_clear) {
+                    if (!exit_clear_timer_started) {
+                        printf("[FLOW] Robot cleared exit sensor. Holding door for another %d ms.\n",
+                               EXIT_DOOR_HOLD_AFTER_CLEAR_MS);
+                        exit_clear_timer_started = true;
+                        exit_clear_hold_ms = 0;
+                    }
+
+                    if (exit_clear_hold_ms < EXIT_DOOR_HOLD_AFTER_CLEAR_MS) {
+                        exit_clear_hold_ms += FSM_TICK_MS;
+                    }
+                } else {
+                    exit_clear_timer_started = false;
+                    exit_clear_hold_ms = 0;
+                }
+
+                if (exit_clear_timer_started &&
+                    exit_clear_hold_ms >= EXIT_DOOR_HOLD_AFTER_CLEAR_MS) {
+                    printf("[FLOW] Exit hold delay elapsed. Releasing door and disabling service mode.\n");
+                    send_espnow_command(CMD_RELEASE_DOOR);
+                    send_espnow_command(CMD_SERVICE_MODE_OFF);
+                    current_floor = destination_floor;
+                    destination_floor = other_floor(current_floor);
+                    state = STATE_FINISHED;
+                    door_close_wait_ms = 0;
+                    exit_clear_hold_ms = 0;
+                    exit_clear_timer_started = false;
+                }
+                break;
+
+            case STATE_FINISHED:
+                if (door_sealed || door_close_wait_ms >= DOOR_CLOSE_TIMEOUT_MS) {
+                    printf("[FLOW] Process finished. Current floor is now %u.\n", current_floor);
+                    state = STATE_ROBOT_FAR;
+                    ble_seen_ms = 0;
+                    distance_confirm_ms = 0;
+                    entry_door_hold_ms = 0;
+                    entry_robot_seen = false;
+                    exit_clear_hold_ms = 0;
+                    exit_clear_timer_started = false;
+                    door_close_wait_ms = 0;
+                } else {
+                    door_close_wait_ms += FSM_TICK_MS;
+                }
+                break;
+
+            case STATE_ERROR_STUCK:
+                printf("[FSM] ERROR_STUCK: releasing door and disabling service mode for safety.\n");
+                send_espnow_command(CMD_RELEASE_DOOR);
+                send_espnow_command(CMD_SERVICE_MODE_OFF);
+                state = STATE_ROBOT_FAR;
+                ble_seen_ms = 0;
+                distance_confirm_ms = 0;
+                door_open_wait_ms = 0;
+                entry_door_hold_ms = 0;
+                entry_robot_seen = false;
+                exit_clear_hold_ms = 0;
+                exit_clear_timer_started = false;
+                door_close_wait_ms = 0;
                 break;
         }
 

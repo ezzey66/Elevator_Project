@@ -11,19 +11,25 @@
 #include "esp_mac.h"
 #include "esp_system.h"
 
-#define RELAY_CALL_PIN         GPIO_NUM_14
-#define RELAY_DOOR_HOLD_PIN    GPIO_NUM_13
-#define RELAY_FLOOR_SELECT_PIN GPIO_NUM_12
+// Relay module mapping.
+// Adjust only these GPIOs if the physical wiring changes.
+#define RELAY_IN1_SERVICE_MODE_PIN GPIO_NUM_13
+#define RELAY_IN2_FLOOR_1_PIN      GPIO_NUM_12
+#define RELAY_IN3_FLOOR_2_PIN      GPIO_NUM_14
+#define RELAY_IN4_DOOR_HOLD_PIN    GPIO_NUM_27
 
-// ESP-NOW commands received from the robot board.
-#define CMD_CALL_ELEVATOR      "CMD_CALL_ELEVATOR"
-#define CMD_HOLD_DOOR_OPEN     "CMD_HOLD_DOOR_OPEN"
-#define CMD_RELEASE_DOOR       "CMD_RELEASE_DOOR"
-#define CMD_SELECT_FLOOR       "CMD_SELECT_FLOOR"
-#define CMD_CONTROLLER_READY   "CMD_CONTROLLER_READY"
+#define RELAY_PULSE_MS             1000
 
-// Peer list: configure remote ESP32 boards here. The controller sends commands to
-// the robot board and receives commands back from it.
+// ESP-NOW commands received from esp32_2.
+#define CMD_SERVICE_MODE_ON        "CMD_SERVICE_MODE_ON"
+#define CMD_SERVICE_MODE_OFF       "CMD_SERVICE_MODE_OFF"
+#define CMD_CALL_FLOOR_1           "CMD_CALL_FLOOR_1"
+#define CMD_CALL_FLOOR_2           "CMD_CALL_FLOOR_2"
+#define CMD_HOLD_DOOR_OPEN         "CMD_HOLD_DOOR_OPEN"
+#define CMD_RELEASE_DOOR           "CMD_RELEASE_DOOR"
+#define CMD_ROBOT_READY            "CMD_ROBOT_READY"
+#define CMD_CONTROLLER_READY       "CMD_CONTROLLER_READY"
+
 static const uint8_t peer_macs[][6] = {
     {0x30, 0x76, 0xF5, 0xF7, 0x57, 0x48}, // ESP32_2 robot board
 };
@@ -35,16 +41,16 @@ static uint8_t own_mac[6] = {0};
 
 typedef enum {
     CTRL_IDLE = 0,
-    CTRL_CALLED,
+    CTRL_SERVICE_ACTIVE,
     CTRL_DOOR_HELD,
-    CTRL_WAITING_FOR_FLOOR,
-    CTRL_FLOOR_SELECTED,
     CTRL_ERROR,
 } controller_state_t;
 
-static volatile bool pulse_call_requested = false;
-static volatile bool pulse_select_requested = false;
+static volatile bool pulse_floor_1_requested = false;
+static volatile bool pulse_floor_2_requested = false;
+static volatile bool service_mode_active = false;
 static volatile bool hold_door_active = false;
+static bool last_service_mode_active = false;
 static bool last_hold_door_active = false;
 static volatile controller_state_t controller_state = CTRL_IDLE;
 
@@ -75,8 +81,6 @@ static bool add_peer(const uint8_t *mac, const char *name)
     return true;
 }
 
-// Send a command to the first configured ESP-NOW peer.
-// This is currently the robot board, but additional peers can be added to the list.
 static bool send_command_to_robot(const char *command)
 {
     if (peer_count == 0) {
@@ -99,9 +103,10 @@ static bool send_command_to_robot(const char *command)
 static void relay_init(void)
 {
     gpio_config_t config = {
-        .pin_bit_mask = (1ULL << RELAY_CALL_PIN) |
-                        (1ULL << RELAY_DOOR_HOLD_PIN) |
-                        (1ULL << RELAY_FLOOR_SELECT_PIN),
+        .pin_bit_mask = (1ULL << RELAY_IN1_SERVICE_MODE_PIN) |
+                        (1ULL << RELAY_IN2_FLOOR_1_PIN) |
+                        (1ULL << RELAY_IN3_FLOOR_2_PIN) |
+                        (1ULL << RELAY_IN4_DOOR_HOLD_PIN),
         .mode = GPIO_MODE_OUTPUT,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en = GPIO_PULLUP_DISABLE,
@@ -109,39 +114,57 @@ static void relay_init(void)
     };
 
     gpio_config(&config);
-    gpio_set_level(RELAY_CALL_PIN, 0);
-    gpio_set_level(RELAY_DOOR_HOLD_PIN, 0);
-    gpio_set_level(RELAY_FLOOR_SELECT_PIN, 0);
+    gpio_set_level(RELAY_IN1_SERVICE_MODE_PIN, 0);
+    gpio_set_level(RELAY_IN2_FLOOR_1_PIN, 0);
+    gpio_set_level(RELAY_IN3_FLOOR_2_PIN, 0);
+    gpio_set_level(RELAY_IN4_DOOR_HOLD_PIN, 0);
 }
 
-
-static void pulse_relay(gpio_num_t pin)
+static void pulse_relay(gpio_num_t pin, const char *name)
 {
+    printf("[RELAY] Pulsing %s.\n", name);
     gpio_set_level(pin, 1);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(RELAY_PULSE_MS));
     gpio_set_level(pin, 0);
+}
+
+static void set_service_mode(bool active)
+{
+    gpio_set_level(RELAY_IN1_SERVICE_MODE_PIN, active ? 1 : 0);
+    service_mode_active = active;
+    controller_state = active ? CTRL_SERVICE_ACTIVE : CTRL_IDLE;
+}
+
+static void set_door_hold(bool active)
+{
+    gpio_set_level(RELAY_IN4_DOOR_HOLD_PIN, active ? 1 : 0);
+    hold_door_active = active;
+    controller_state = active ? CTRL_DOOR_HELD :
+                       service_mode_active ? CTRL_SERVICE_ACTIVE : CTRL_IDLE;
 }
 
 static void process_incoming_command(const char *command)
 {
-    if (strcmp(command, CMD_CALL_ELEVATOR) == 0) {
-        printf("[CTRL] Received CMD_CALL_ELEVATOR. Triggering elevator call relay.\n");
-        pulse_call_requested = true;
-        controller_state = CTRL_CALLED;
+    if (strcmp(command, CMD_SERVICE_MODE_ON) == 0) {
+        printf("[CTRL] Service mode ON.\n");
+        set_service_mode(true);
+    } else if (strcmp(command, CMD_SERVICE_MODE_OFF) == 0) {
+        printf("[CTRL] Service mode OFF.\n");
+        set_service_mode(false);
+    } else if (strcmp(command, CMD_CALL_FLOOR_1) == 0) {
+        printf("[CTRL] Floor 1 requested.\n");
+        pulse_floor_1_requested = true;
+    } else if (strcmp(command, CMD_CALL_FLOOR_2) == 0) {
+        printf("[CTRL] Floor 2 requested.\n");
+        pulse_floor_2_requested = true;
     } else if (strcmp(command, CMD_HOLD_DOOR_OPEN) == 0) {
-        printf("[CTRL] Received CMD_HOLD_DOOR_OPEN. Engaging HOLD DOOR relay.\n");
-        gpio_set_level(RELAY_DOOR_HOLD_PIN, 1);
-        hold_door_active = true;
-        controller_state = CTRL_DOOR_HELD;
+        printf("[CTRL] Holding door open.\n");
+        set_door_hold(true);
     } else if (strcmp(command, CMD_RELEASE_DOOR) == 0) {
-        printf("[CTRL] Received CMD_RELEASE_DOOR. Releasing HOLD DOOR relay.\n");
-        gpio_set_level(RELAY_DOOR_HOLD_PIN, 0);
-        hold_door_active = false;
-        controller_state = CTRL_WAITING_FOR_FLOOR;
-    } else if (strcmp(command, CMD_SELECT_FLOOR) == 0) {
-        printf("[CTRL] Received CMD_SELECT_FLOOR. Triggering floor select relay.\n");
-        pulse_select_requested = true;
-        controller_state = CTRL_FLOOR_SELECTED;
+        printf("[CTRL] Releasing door hold.\n");
+        set_door_hold(false);
+    } else if (strcmp(command, CMD_ROBOT_READY) == 0) {
+        printf("[CTRL] Robot reported ready.\n");
     } else {
         printf("[ESP-NOW] Unknown controller command: %s\n", command);
     }
@@ -159,13 +182,13 @@ static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *da
            recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
            recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5],
            incoming);
-    printf("[ESP-NOW] Received: %s\n", incoming);
 
     process_incoming_command(incoming);
 }
 
 static void on_data_sent(const esp_now_send_info_t *info, esp_now_send_status_t status)
 {
+    (void)info;
     printf("[ESP-NOW] TX status: %s\n", status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
 }
 
@@ -191,7 +214,6 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_now_register_recv_cb(on_data_recv));
     ESP_ERROR_CHECK(esp_now_register_send_cb(on_data_sent));
 
-    // Print local MAC so you can verify peer configuration matches physical boards.
     ESP_ERROR_CHECK(esp_read_mac(own_mac, ESP_MAC_WIFI_STA));
     printf("[ESP-NOW] Controller local MAC: ");
     print_mac(own_mac);
@@ -204,31 +226,27 @@ void app_main(void)
     }
 
     relay_init();
-
-    // Send a startup handshake so the remote board can verify ESP-NOW connectivity.
     send_command_to_robot(CMD_CONTROLLER_READY);
-    printf("[CTRL] Controller online. Relays initialized.\n");
+    printf("[CTRL] Controller online. Relay mapping: IN1 service, IN2 floor1, IN3 floor2, IN4 door hold.\n");
 
     while (1) {
-
-        if (pulse_call_requested) {
-            pulse_call_requested = false;
-            printf("[RELAY] Pulsing CALL ELEVATOR relay.\n");
-            pulse_relay(RELAY_CALL_PIN);
+        if (pulse_floor_1_requested) {
+            pulse_floor_1_requested = false;
+            pulse_relay(RELAY_IN2_FLOOR_1_PIN, "FLOOR 1 / IN2");
         }
 
-        if (pulse_select_requested) {
-            pulse_select_requested = false;
-            printf("[RELAY] Pulsing SELECT FLOOR relay.\n");
-            pulse_relay(RELAY_FLOOR_SELECT_PIN);
+        if (pulse_floor_2_requested) {
+            pulse_floor_2_requested = false;
+            pulse_relay(RELAY_IN3_FLOOR_2_PIN, "FLOOR 2 / IN3");
+        }
+
+        if (service_mode_active != last_service_mode_active) {
+            printf("[STATE] Service mode %s.\n", service_mode_active ? "active" : "inactive");
+            last_service_mode_active = service_mode_active;
         }
 
         if (hold_door_active != last_hold_door_active) {
-            if (hold_door_active) {
-                printf("[STATE] HOLD_DOOR active. Keeping door relay engaged.\n");
-            } else {
-                printf("[STATE] HOLD_DOOR released. Door relay disengaged.\n");
-            }
+            printf("[STATE] Door hold %s.\n", hold_door_active ? "active" : "released");
             last_hold_door_active = hold_door_active;
         }
 
