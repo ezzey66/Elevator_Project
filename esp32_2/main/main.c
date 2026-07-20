@@ -25,7 +25,10 @@ static const bool use_specific_beacon = false;
 static const uint8_t target_ble_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 static bool last_object_close = false;
 
-// Peer list: configure the controller board here.
+// BLE proximity logic follows the elevator flowchart:
+// - ROBOT_CLOSE when the beacon RSSI crosses the close threshold.
+// - ROBOT_FAR only when the beacon RSSI crosses the far threshold.
+// - If packets briefly disappear, keep the last confirmed state until an explicit far signal arrives.
 // Additional robot or support boards can be added as needed.
 static const uint8_t peer_macs[][6] = {
     {0x30, 0x76, 0xF5, 0xF8, 0x4D, 0x7C}, // controller_esp32 board
@@ -38,7 +41,7 @@ static uint8_t own_mac[6] = {0};
 static bool last_path_clear = false;
 static bool last_door_sealed = false;
 static bool ble_prints_enabled = true; // set to true to re-enable BLE prints
-static bool enable_ble = false; // enabled now so BLE robot location is used
+static bool enable_ble = true; // BLE must be enabled so beacon proximity can drive the flow
 
 typedef enum {
     ROBOT_FAR,
@@ -61,8 +64,8 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 
 #define FSM_TICK_MS            100
 #define BLE_CONFIRM_MS         10000
-#define BLE_CLOSE_RSSI         -85
-#define BLE_FAR_RSSI           -90
+#define BLE_CLOSE_RSSI         -70
+#define BLE_FAR_RSSI           -85
 #define DISTANCE_CONFIRM_MS    5000
 #define DOOR_CLOSE_TIMEOUT_MS  12000
 
@@ -232,18 +235,20 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                     if (ble_prints_enabled) {
                         printf("[BLE] rssi=%d\n", rssi);
                     }
-                    if (rssi <= BLE_FAR_RSSI) {
-                        if (ble_prox != BLE_PROX_FAR) {
-                            ble_prox = BLE_PROX_FAR;
-                            if (ble_prints_enabled) printf("[BLE] Prox => FAR (rssi=%d)\n", rssi);
-                        }
-                    } else if (rssi >= BLE_CLOSE_RSSI) {
+
+                    // Use a two-threshold approach so the flow only enters ROBOT_CLOSE when the
+                    // beacon is clearly near, and only returns to ROBOT_FAR on an explicit far signal.
+                    if (rssi >= BLE_CLOSE_RSSI) {
                         if (ble_prox != BLE_PROX_CLOSE) {
                             ble_prox = BLE_PROX_CLOSE;
                             if (ble_prints_enabled) printf("[BLE] Prox => CLOSE (rssi=%d)\n", rssi);
                         }
+                    } else if (rssi <= BLE_FAR_RSSI) {
+                        if (ble_prox != BLE_PROX_FAR) {
+                            ble_prox = BLE_PROX_FAR;
+                            if (ble_prints_enabled) printf("[BLE] Prox => FAR (rssi=%d)\n", rssi);
+                        }
                     }
-
                 }
             }
             break;
