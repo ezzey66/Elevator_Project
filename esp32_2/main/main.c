@@ -15,17 +15,26 @@
 #include "sensor.h"
 #include "reed_switch.h"
 #include "esp_log.h"
+#include "esp_system.h"
 
-static TickType_t ble_last_seen_ticks = 0;
 static int8_t last_ble_rssi = -127;
 typedef enum { BLE_PROX_UNKNOWN = 0, BLE_PROX_CLOSE, BLE_PROX_FAR } ble_proximity_t;
 static ble_proximity_t ble_prox = BLE_PROX_FAR;
 static const bool use_specific_beacon = false;
 
-/* BLE state is decided by direct RSSI thresholds and hold time */
-
 static const uint8_t target_ble_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 static bool last_object_close = false;
+
+// Peer list: configure the controller board here.
+// Additional robot or support boards can be added as needed.
+static const uint8_t peer_macs[][6] = {
+    {0x30, 0x76, 0xF5, 0xF8, 0x4D, 0x7C}, // controller_esp32 board
+};
+static const char *peer_names[] = {
+    "CONTROLLER_ESP32",
+};
+static const size_t peer_count = sizeof(peer_macs) / sizeof(peer_macs[0]);
+static uint8_t own_mac[6] = {0};
 static bool last_path_clear = false;
 static bool last_door_sealed = false;
 static bool ble_prints_enabled = true; // set to true to re-enable BLE prints
@@ -43,17 +52,17 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
     printf("[ESP-NOW] send callback invoked, status=%d\n", status);
 }
 
+// ESP-NOW commands sent to the controller board.
 #define CMD_CALL_ELEVATOR      "CMD_CALL_ELEVATOR"
 #define CMD_HOLD_DOOR_OPEN     "CMD_HOLD_DOOR_OPEN"
 #define CMD_RELEASE_DOOR       "CMD_RELEASE_DOOR"
 #define CMD_SELECT_FLOOR       "CMD_SELECT_FLOOR"
+#define CMD_ROBOT_READY        "CMD_ROBOT_READY"
 
 #define FSM_TICK_MS            100
 #define BLE_CONFIRM_MS         10000
 #define BLE_CLOSE_RSSI         -85
 #define BLE_FAR_RSSI           -90
-#define BLE_HOLD_MS            5000
-#define BLE_VISIBILITY_TIMEOUT_MS 1000
 #define DISTANCE_CONFIRM_MS    5000
 #define DOOR_CLOSE_TIMEOUT_MS  12000
 
@@ -70,16 +79,50 @@ typedef enum {
     STATE_ERROR_STUCK,
 } elevator_state_t;
 
-static const uint8_t controller_mac[6] = {0x30, 0x76, 0xF5, 0xF8, 0x4D, 0x7C};
+static const uint8_t own_mac_prefix[3] = {0x30, 0x76, 0xF5};
+
+static void print_mac(const uint8_t *mac)
+{
+    printf("%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static bool add_peer(const uint8_t *mac, const char *name)
+{
+    esp_now_peer_info_t peer_info = {};
+    memcpy(peer_info.peer_addr, mac, ESP_NOW_ETH_ALEN);
+    peer_info.channel = 1;
+    peer_info.encrypt = false;
+
+    esp_err_t err = esp_now_add_peer(&peer_info);
+    if (err != ESP_OK) {
+        printf("[ESP-NOW] Failed to add peer %s: ", name);
+        print_mac(mac);
+        printf(" (err=%d)\n", err);
+        return false;
+    }
+
+    printf("[ESP-NOW] Added peer %s: ", name);
+    print_mac(mac);
+    printf("\n");
+    return true;
+}
 
 static bool send_espnow_command(const char *command)
 {
-    esp_err_t err = esp_now_send(controller_mac, (const uint8_t *)command, strlen(command));
+    if (peer_count == 0) {
+        printf("[ESP-NOW] No peer configured, cannot send: %s\n", command);
+        return false;
+    }
+
+    esp_err_t err = esp_now_send(peer_macs[0], (const uint8_t *)command, strlen(command));
     if (err != ESP_OK) {
         printf("[ESP-NOW] Failed to send %s (err=%d)\n", command, err);
         return false;
     }
-    printf("[ESP-NOW] Sent: %s\n", command);
+    printf("[ESP-NOW] Sent: %s -> ", command);
+    print_mac(peer_macs[0]);
+    printf("\n");
     return true;
 }
 
@@ -90,8 +133,6 @@ static bool is_target_ble_address(const uint8_t *addr)
     }
     return (memcmp(addr, target_ble_mac, sizeof(target_ble_mac)) == 0);
 }
-
-static bool is_ble_target_visible(void);
 
 static bool is_object_close(void)
 {
@@ -108,29 +149,41 @@ static bool is_door_sealed(void)
     return is_magnet_present();
 }
 
+static void process_controller_command(const char *command)
+{
+    printf("[ESP-NOW] Controller command received: %s\n", command);
+}
+
+static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
+{
+    if (len <= 0 || len >= 64) {
+        return;
+    }
+
+    char incoming[64] = {0};
+    snprintf(incoming, sizeof(incoming), "%.*s", len, data);
+    printf("[ESP-NOW] RX from %02X:%02X:%02X:%02X:%02X:%02X -> %s\n",
+           recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+           recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5],
+           incoming);
+
+    process_controller_command(incoming);
+}
+
 static bool is_robot_far(void)
 {
-    return !is_ble_target_visible();
+    if (!enable_ble) {
+        return !is_object_close();
+    }
+    return (ble_prox == BLE_PROX_FAR);
 }
 
 static bool is_robot_close(void)
 {
-    return is_ble_target_visible();
-}
-
-static bool is_ble_target_visible(void)
-{
-    if (ble_prox != BLE_PROX_CLOSE) {
-        return false;
+    if (!enable_ble) {
+        return is_object_close();
     }
-    if (ble_last_seen_ticks == 0) {
-        return false;
-    }
-    TickType_t now = xTaskGetTickCount();
-    if ((now - ble_last_seen_ticks) <= pdMS_TO_TICKS(BLE_HOLD_MS)) {
-        return true;
-    }
-    return false;
+    return (ble_prox == BLE_PROX_CLOSE);
 }
 
 static void init_sensor_pins(void)
@@ -175,7 +228,6 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             if (param->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
                 if (is_target_ble_address(param->scan_rst.bda)) {
                     last_ble_rssi = param->scan_rst.rssi;
-                    ble_last_seen_ticks = xTaskGetTickCount();
                     int8_t rssi = last_ble_rssi;
                     if (ble_prints_enabled) {
                         printf("[BLE] rssi=%d\n", rssi);
@@ -226,12 +278,21 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(on_data_recv));
 
-    esp_now_peer_info_t peer_info = {};
-    memcpy(peer_info.peer_addr, controller_mac, sizeof(controller_mac));
-    peer_info.channel = 1;
-    peer_info.encrypt = false;
-    ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
+    ESP_ERROR_CHECK(esp_read_mac(own_mac, ESP_MAC_WIFI_STA));
+    printf("[ESP-NOW] Robot local MAC: ");
+    print_mac(own_mac);
+    printf("\n");
+    
+    for (size_t i = 0; i < peer_count; ++i) {
+        if (!add_peer(peer_macs[i], peer_names[i])) {
+            printf("[ESP-NOW] Warning: peer %s may not be reachable.\n", peer_names[i]);
+        }
+    }
+
+    // Send a startup handshake so the controller knows ESP-NOW is ready.
+    send_espnow_command("CMD_ROBOT_READY");
 
     init_sensor_pins();
     {
@@ -360,7 +421,7 @@ void app_main(void)
 
             case STATE_WAIT_FOR_DOOR:
                 if (!door_sealed) {
-                    printf("[FLOW] Door opened by controller. Sending HOLD DOOR OPEN command.\n");
+                    printf("[FLOW] Door opened detected by robot. Sending HOLD DOOR OPEN command.\n");
                     send_espnow_command(CMD_HOLD_DOOR_OPEN);
                     state = STATE_HOLD_DOOR_OPEN;
                     release_sent = false;
@@ -379,7 +440,7 @@ void app_main(void)
 
             case STATE_SELECT_FLOOR:
                 if (door_sealed) {
-                    printf("[FLOW] Door sealed after release. Sending SELECT FLOOR and resetting flow.\n");
+                    printf("[FLOW] Door resealed on robot side. Sending SELECT FLOOR and resetting flow.\n");
                     send_espnow_command(CMD_SELECT_FLOOR);
                     state = STATE_ROBOT_FAR;
                     distance_confirm_ms = 0;
