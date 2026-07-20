@@ -17,7 +17,15 @@
 #include "esp_log.h"
 #include "esp_system.h"
 
+#include <math.h>
+
 static int8_t last_ble_rssi = -127;
+static float filtered_ble_rssi = 0.0f;
+static bool ble_rssi_filter_initialized = false;
+#define BLE_RSSI_STABILITY_WINDOW 10
+static float filtered_rssi_samples[BLE_RSSI_STABILITY_WINDOW] = {0};
+static uint8_t filtered_rssi_sample_count = 0;
+static uint8_t filtered_rssi_sample_index = 0;
 typedef enum { BLE_PROX_UNKNOWN = 0, BLE_PROX_CLOSE, BLE_PROX_FAR } ble_proximity_t;
 static ble_proximity_t ble_prox = BLE_PROX_FAR;
 static const bool use_specific_beacon = false;
@@ -213,6 +221,28 @@ static void ble_scan_start(void)
     }
 }
 
+static void update_rssi_stability(float rssi, float *mean, float *stddev)
+{
+    filtered_rssi_samples[filtered_rssi_sample_index] = rssi;
+    filtered_rssi_sample_index = (filtered_rssi_sample_index + 1) % BLE_RSSI_STABILITY_WINDOW;
+    if (filtered_rssi_sample_count < BLE_RSSI_STABILITY_WINDOW) {
+        filtered_rssi_sample_count++;
+    }
+
+    *mean = 0.0f;
+    for (uint8_t i = 0; i < filtered_rssi_sample_count; ++i) {
+        *mean += filtered_rssi_samples[i];
+    }
+    *mean /= filtered_rssi_sample_count;
+
+    float variance = 0.0f;
+    for (uint8_t i = 0; i < filtered_rssi_sample_count; ++i) {
+        float difference = filtered_rssi_samples[i] - *mean;
+        variance += difference * difference;
+    }
+    *stddev = sqrtf(variance / filtered_rssi_sample_count);
+}
+
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
     switch (event) {
@@ -231,22 +261,33 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             if (param->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
                 if (is_target_ble_address(param->scan_rst.bda)) {
                     last_ble_rssi = param->scan_rst.rssi;
-                    int8_t rssi = last_ble_rssi;
+                    int8_t current_rssi = last_ble_rssi;
+                    if (!ble_rssi_filter_initialized) {
+                        filtered_ble_rssi = current_rssi;
+                        ble_rssi_filter_initialized = true;
+                    } else {
+                        filtered_ble_rssi = (0.85f * filtered_ble_rssi) + (0.15f * current_rssi);
+                    }
+
+                    float mean_rssi;
+                    float stddev_rssi;
+                    update_rssi_stability(filtered_ble_rssi, &mean_rssi, &stddev_rssi);
                     if (ble_prints_enabled) {
-                        printf("[BLE] rssi=%d\n", rssi);
+                        printf("[BLE] RSSI raw=%d filtered=%.1f\n", current_rssi, filtered_ble_rssi);
+                        printf("[BLE] Mean RSSI=%.1f StdDev RSSI=%.2f\n", mean_rssi, stddev_rssi);
                     }
 
                     // Use a two-threshold approach so the flow only enters ROBOT_CLOSE when the
                     // beacon is clearly near, and only returns to ROBOT_FAR on an explicit far signal.
-                    if (rssi >= BLE_CLOSE_RSSI) {
+                    if (stddev_rssi < 2.0f && filtered_ble_rssi >= BLE_CLOSE_RSSI) {
                         if (ble_prox != BLE_PROX_CLOSE) {
                             ble_prox = BLE_PROX_CLOSE;
-                            if (ble_prints_enabled) printf("[BLE] Prox => CLOSE (rssi=%d)\n", rssi);
+                            if (ble_prints_enabled) printf("[BLE] Prox => CLOSE (filtered_rssi=%.1f)\n", filtered_ble_rssi);
                         }
-                    } else if (rssi <= BLE_FAR_RSSI) {
+                    } else if (stddev_rssi < 2.0f && filtered_ble_rssi <= BLE_FAR_RSSI) {
                         if (ble_prox != BLE_PROX_FAR) {
                             ble_prox = BLE_PROX_FAR;
-                            if (ble_prints_enabled) printf("[BLE] Prox => FAR (rssi=%d)\n", rssi);
+                            if (ble_prints_enabled) printf("[BLE] Prox => FAR (filtered_rssi=%.1f)\n", filtered_ble_rssi);
                         }
                     }
                 }
