@@ -22,6 +22,7 @@
 static int8_t last_ble_rssi = -127;
 static float filtered_ble_rssi = 0.0f;
 static bool ble_rssi_filter_initialized = false;
+static volatile uint32_t ble_seen_ms = 0;
 #define BLE_RSSI_STABILITY_WINDOW 10
 static float filtered_rssi_samples[BLE_RSSI_STABILITY_WINDOW] = {0};
 static uint8_t filtered_rssi_sample_count = 0;
@@ -72,8 +73,8 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 
 #define FSM_TICK_MS            100
 #define BLE_CONFIRM_MS         10000
-#define BLE_CLOSE_RSSI         -70
-#define BLE_FAR_RSSI           -85
+#define BLE_ENTER_RSSI         -68
+#define BLE_EXIT_RSSI          -78
 #define DISTANCE_CONFIRM_MS    5000
 #define DOOR_CLOSE_TIMEOUT_MS  12000
 
@@ -272,23 +273,28 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                     float mean_rssi;
                     float stddev_rssi;
                     update_rssi_stability(filtered_ble_rssi, &mean_rssi, &stddev_rssi);
-                    if (ble_prints_enabled) {
-                        printf("[BLE] RSSI raw=%d filtered=%.1f\n", current_rssi, filtered_ble_rssi);
-                        printf("[BLE] Mean RSSI=%.1f StdDev RSSI=%.2f\n", mean_rssi, stddev_rssi);
-                    }
-
                     // Use a two-threshold approach so the flow only enters ROBOT_CLOSE when the
                     // beacon is clearly near, and only returns to ROBOT_FAR on an explicit far signal.
-                    if (stddev_rssi < 2.0f && filtered_ble_rssi >= BLE_CLOSE_RSSI) {
+                    if (stddev_rssi < 2.0f && filtered_ble_rssi >= BLE_ENTER_RSSI) {
                         if (ble_prox != BLE_PROX_CLOSE) {
                             ble_prox = BLE_PROX_CLOSE;
                             if (ble_prints_enabled) printf("[BLE] Prox => CLOSE (filtered_rssi=%.1f)\n", filtered_ble_rssi);
                         }
-                    } else if (stddev_rssi < 2.0f && filtered_ble_rssi <= BLE_FAR_RSSI) {
+                    } else if (stddev_rssi < 2.0f && filtered_ble_rssi <= BLE_EXIT_RSSI) {
                         if (ble_prox != BLE_PROX_FAR) {
                             ble_prox = BLE_PROX_FAR;
                             if (ble_prints_enabled) printf("[BLE] Prox => FAR (filtered_rssi=%.1f)\n", filtered_ble_rssi);
                         }
+                    }
+
+                    if (ble_prints_enabled) {
+                        const char *ble_state = ble_prox == BLE_PROX_CLOSE ? "CLOSE" :
+                                                ble_prox == BLE_PROX_FAR ? "FAR" : "UNKNOWN";
+                        printf("[BLE] ADV MAC=");
+                        print_mac(param->scan_rst.bda);
+                        printf(" RSSI raw=%d filtered=%.1f Mean RSSI=%.1f StdDev RSSI=%.2f state=%s confirm_ms=%lu\n",
+                               current_rssi, filtered_ble_rssi, mean_rssi, stddev_rssi,
+                               ble_state, (unsigned long)ble_seen_ms);
                     }
                 }
             }
@@ -366,7 +372,6 @@ void app_main(void)
 
     elevator_state_t state = STATE_ROBOT_FAR;
     elevator_state_t last_state = STATE_ROBOT_FAR;
-    uint32_t ble_seen_ms = 0;
     uint32_t distance_confirm_ms = 0;
     uint32_t door_close_wait_ms = 0;
     bool release_sent = false;
