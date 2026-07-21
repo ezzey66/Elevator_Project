@@ -185,19 +185,19 @@ static bool ble_addr_matches(const uint8_t *addr, const uint8_t *target)
 
 static bool should_use_ble_advertisement(const uint8_t *addr, int8_t rssi)
 {
+    (void)rssi;
+
     if (use_specific_beacon) {
         return ble_addr_matches(addr, target_ble_mac);
     }
 
     if (!has_learned_ble_mac) {
-        if (rssi < BLE_ENTER_RSSI) {
-            return false;
-        }
         memcpy(learned_ble_mac, addr, sizeof(learned_ble_mac));
         has_learned_ble_mac = true;
+
         printf("[BLE] Learned beacon MAC: ");
         print_mac(learned_ble_mac);
-        printf(" (rssi=%d)\n", rssi);
+        printf("\n");
     }
 
     return ble_addr_matches(addr, learned_ble_mac);
@@ -298,35 +298,51 @@ static void update_ble_proximity(float rssi, float stddev)
     static uint8_t close_candidate_count = 0;
     static uint8_t far_candidate_count = 0;
 
-//    if (filtered_rssi_sample_count < BLE_RSSI_STABILITY_WINDOW) {
-//        close_candidate_count = 0;
-//        far_candidate_count = 0;
-//        return;
-//    }
-
-    if (rssi <= BLE_ENTER_RSSI) {
-        if (close_candidate_count < BLE_CLOSE_CONFIRM_SAMPLES) {
-            close_candidate_count++;
-        }
-        far_candidate_count = 0;
-    } else if (rssi >= BLE_EXIT_RSSI) {
-        if (far_candidate_count < BLE_FAR_CONFIRM_SAMPLES) {
-            far_candidate_count++;
-        }
-        close_candidate_count = 0;
-    } else {
-        close_candidate_count = 0;
-        far_candidate_count = 0;
+    if (filtered_rssi_sample_count < BLE_RSSI_STABILITY_WINDOW) {
+        return;
     }
 
-    if (ble_prox != BLE_PROX_CLOSE &&
-        close_candidate_count >= BLE_CLOSE_CONFIRM_SAMPLES) {
-        set_ble_proximity(BLE_PROX_CLOSE, rssi, stddev, "RSSI close threshold");
-        close_candidate_count = 0;
+    int value = (int)fabsf(rssi);
+
+    printf("[BLE] RSSI=%d close=%u far=%u\n",
+           value,
+           close_candidate_count,
+           far_candidate_count);
+
+    if (value <= BLE_ENTER_RSSI) {
+
+        close_candidate_count++;
         far_candidate_count = 0;
-    } else if (ble_prox != BLE_PROX_FAR &&
-               far_candidate_count >= BLE_FAR_CONFIRM_SAMPLES) {
-        set_ble_proximity(BLE_PROX_FAR, rssi, stddev, "RSSI far threshold");
+
+        if (close_candidate_count >= BLE_CLOSE_CONFIRM_SAMPLES &&
+            ble_prox != BLE_PROX_CLOSE) {
+
+            set_ble_proximity(BLE_PROX_CLOSE,
+                              value,
+                              stddev,
+                              "Beacon perto");
+
+            close_candidate_count = 0;
+        }
+
+    } else if (value >= BLE_EXIT_RSSI) {
+
+        far_candidate_count++;
+        close_candidate_count = 0;
+
+        if (far_candidate_count >= BLE_FAR_CONFIRM_SAMPLES &&
+            ble_prox != BLE_PROX_FAR) {
+
+            set_ble_proximity(BLE_PROX_FAR,
+                              value,
+                              stddev,
+                              "Beacon longe");
+
+            far_candidate_count = 0;
+        }
+
+    } else {
+
         close_candidate_count = 0;
         far_candidate_count = 0;
     }
@@ -397,7 +413,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                 if (should_use_ble_advertisement(param->scan_rst.bda, param->scan_rst.rssi)) {
                     last_ble_rssi = param->scan_rst.rssi;
                     last_ble_adv_time_ms = now_ms();
-                    int8_t current_rssi = (int8_t)abs(last_ble_rssi);
+                    float current_rssi = (float)last_ble_rssi;
                     if (!ble_rssi_filter_initialized) {
                         filtered_ble_rssi = current_rssi;
                         ble_rssi_filter_initialized = true;
