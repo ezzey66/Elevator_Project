@@ -17,6 +17,7 @@
 #include "reed_switch.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 
 #include <math.h>
 
@@ -24,15 +25,16 @@ static int8_t last_ble_rssi = -127;
 static float filtered_ble_rssi = 0.0f;
 static bool ble_rssi_filter_initialized = false;
 static volatile uint32_t ble_seen_ms = 0;
+static volatile int64_t last_ble_adv_time_ms = 0;
 #define BLE_RSSI_STABILITY_WINDOW 10
 static float filtered_rssi_samples[BLE_RSSI_STABILITY_WINDOW] = {0};
 static uint8_t filtered_rssi_sample_count = 0;
 static uint8_t filtered_rssi_sample_index = 0;
 typedef enum { BLE_PROX_UNKNOWN = 0, BLE_PROX_CLOSE, BLE_PROX_FAR } ble_proximity_t;
 static ble_proximity_t ble_prox = BLE_PROX_FAR;
-static const bool use_specific_beacon = false;
+static const bool use_specific_beacon = true;
 
-static const uint8_t target_ble_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t target_ble_mac[6] = {0x7C, 0xD9, 0xF4, 0x08, 0xD5, 0x85};
 static uint8_t learned_ble_mac[6] = {0};
 static bool has_learned_ble_mac = false;
 static bool last_object_close = false;
@@ -52,7 +54,7 @@ static const size_t peer_count = sizeof(peer_macs) / sizeof(peer_macs[0]);
 static uint8_t own_mac[6] = {0};
 static bool last_path_clear = false;
 static bool last_door_sealed = false;
-static bool ble_prints_enabled = false; // set to true to re-enable BLE prints
+static bool ble_prints_enabled = true; // set to true to re-enable BLE prints
 static bool enable_ble = true; // BLE must be enabled so beacon proximity can drive the flow
 
 typedef enum {
@@ -78,11 +80,14 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 
 #define FSM_TICK_MS            100
 #define BLE_CONFIRM_MS         10000
-#define BLE_ENTER_RSSI         -68
-#define BLE_EXIT_RSSI          -78
-#define BLE_MAX_STABLE_STDDEV  4.0f
-#define BLE_CLOSE_CONFIRM_SAMPLES 6
-#define BLE_FAR_CONFIRM_SAMPLES   12
+#define BLE_ENTER_RSSI         20
+#define BLE_EXIT_RSSI          60
+#define BLE_CLOSE_CONFIRM_SAMPLES 2
+#define BLE_FAR_CONFIRM_SAMPLES   6
+#define BLE_CLOSE_RSSI_MAX     40
+#define BLE_FAR_RSSI_MIN       60
+#define BLE_LOST_TIMEOUT_MS    4000
+#define BLE_MAX_STABLE_STDDEV  6.0f
 #define DISTANCE_CONFIRM_MS    5000
 #define ENTRY_DOOR_HOLD_AFTER_DETECT_MS 5000
 #define EXIT_DOOR_HOLD_AFTER_CLEAR_MS   5000
@@ -164,10 +169,24 @@ static const char *floor_command(uint8_t floor)
     return (floor == 1) ? CMD_CALL_FLOOR_1 : CMD_CALL_FLOOR_2;
 }
 
+static bool ble_addr_matches(const uint8_t *addr, const uint8_t *target)
+{
+    if (memcmp(addr, target, 6) == 0) {
+        return true;
+    }
+
+    for (uint8_t i = 0; i < 6; ++i) {
+        if (addr[i] != target[5 - i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool should_use_ble_advertisement(const uint8_t *addr, int8_t rssi)
 {
     if (use_specific_beacon) {
-        return (memcmp(addr, target_ble_mac, sizeof(target_ble_mac)) == 0);
+        return ble_addr_matches(addr, target_ble_mac);
     }
 
     if (!has_learned_ble_mac) {
@@ -181,7 +200,7 @@ static bool should_use_ble_advertisement(const uint8_t *addr, int8_t rssi)
         printf(" (rssi=%d)\n", rssi);
     }
 
-    return (memcmp(addr, learned_ble_mac, sizeof(learned_ble_mac)) == 0);
+    return ble_addr_matches(addr, learned_ble_mac);
 }
 
 static bool is_object_close(void)
@@ -236,13 +255,50 @@ static bool is_robot_close(void)
     return (ble_prox == BLE_PROX_CLOSE);
 }
 
+static int64_t now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+static void reset_ble_rssi_filter(void)
+{
+    ble_rssi_filter_initialized = false;
+    filtered_ble_rssi = 0.0f;
+    filtered_rssi_sample_count = 0;
+    filtered_rssi_sample_index = 0;
+    memset(filtered_rssi_samples, 0, sizeof(filtered_rssi_samples));
+}
+
+static void set_ble_proximity(ble_proximity_t new_state, float rssi, float stddev, const char *reason)
+{
+    if (ble_prox == new_state) {
+        return;
+    }
+
+    ble_prox = new_state;
+    printf("[BLE] Prox => %s (%s, filtered_rssi=%.1f, last_raw=%d, stddev=%.2f)\n",
+           new_state == BLE_PROX_CLOSE ? "CLOSE" : "FAR",
+           reason, rssi, last_ble_rssi, stddev);
+}
+
+static void check_ble_timeout(void)
+{
+    if (last_ble_adv_time_ms == 0 || ble_prox == BLE_PROX_FAR) {
+        return;
+    }
+
+    if ((now_ms() - last_ble_adv_time_ms) >= BLE_LOST_TIMEOUT_MS) {
+        set_ble_proximity(BLE_PROX_FAR, filtered_ble_rssi, 0.0f, "beacon timeout");
+        reset_ble_rssi_filter();
+    }
+}
+
 static void update_ble_proximity(float rssi, float stddev)
 {
     static uint8_t close_candidate_count = 0;
     static uint8_t far_candidate_count = 0;
 
-    if (filtered_rssi_sample_count < BLE_RSSI_STABILITY_WINDOW ||
-        stddev > BLE_MAX_STABLE_STDDEV) {
+    if (filtered_rssi_sample_count < BLE_RSSI_STABILITY_WINDOW) {
         close_candidate_count = 0;
         far_candidate_count = 0;
         return;
@@ -265,20 +321,14 @@ static void update_ble_proximity(float rssi, float stddev)
 
     if (ble_prox != BLE_PROX_CLOSE &&
         close_candidate_count >= BLE_CLOSE_CONFIRM_SAMPLES) {
-        ble_prox = BLE_PROX_CLOSE;
+        set_ble_proximity(BLE_PROX_CLOSE, rssi, stddev, "RSSI close threshold");
         close_candidate_count = 0;
         far_candidate_count = 0;
-        if (ble_prints_enabled) {
-            printf("[BLE] Prox => CLOSE (filtered_rssi=%.1f, stddev=%.2f)\n", rssi, stddev);
-        }
     } else if (ble_prox != BLE_PROX_FAR &&
                far_candidate_count >= BLE_FAR_CONFIRM_SAMPLES) {
-        ble_prox = BLE_PROX_FAR;
+        set_ble_proximity(BLE_PROX_FAR, rssi, stddev, "RSSI far threshold");
         close_candidate_count = 0;
         far_candidate_count = 0;
-        if (ble_prints_enabled) {
-            printf("[BLE] Prox => FAR (filtered_rssi=%.1f, stddev=%.2f)\n", rssi, stddev);
-        }
     }
 }
 
@@ -346,18 +396,19 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             if (param->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
                 if (should_use_ble_advertisement(param->scan_rst.bda, param->scan_rst.rssi)) {
                     last_ble_rssi = param->scan_rst.rssi;
+                    last_ble_adv_time_ms = now_ms();
                     int8_t current_rssi = last_ble_rssi;
                     if (!ble_rssi_filter_initialized) {
                         filtered_ble_rssi = current_rssi;
                         ble_rssi_filter_initialized = true;
                     } else {
-                        filtered_ble_rssi = (0.85f * filtered_ble_rssi) + (0.15f * current_rssi);
+                        filtered_ble_rssi = (0.65f * filtered_ble_rssi) + (0.35f * current_rssi);
                     }
 
                     float mean_rssi;
                     float stddev_rssi;
                     update_rssi_stability(filtered_ble_rssi, &mean_rssi, &stddev_rssi);
-                    update_ble_proximity(filtered_ble_rssi, stddev_rssi);
+                    update_ble_proximity(current_rssi, stddev_rssi);
 
                     if (ble_prints_enabled) {
                         const char *ble_state = ble_prox == BLE_PROX_CLOSE ? "CLOSE" :
@@ -408,6 +459,9 @@ void app_main(void)
     printf("[ESP-NOW] Robot local MAC: ");
     print_mac(own_mac);
     printf("\n");
+    printf("[BLE] Target Eye Beacon MAC: ");
+    print_mac(target_ble_mac);
+    printf("\n");
     
     for (size_t i = 0; i < peer_count; ++i) {
         if (!add_peer(peer_macs[i], peer_names[i])) {
@@ -457,6 +511,8 @@ void app_main(void)
     printf("[FLOW] State changed: ROBOT_FAR\n");
 
     while (1) {
+        check_ble_timeout();
+
         bool object_close = is_object_close();
         bool door_sealed = is_door_sealed();
         bool path_clear = is_path_clear();

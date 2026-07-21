@@ -14,6 +14,6 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\alexa\\Documents\\desktop\\Elevator_Project\\controller_esp32\\build"
   ],
-  "idf.portWin": "COM6",
+  "idf.portWin": "COM3",
   "idf.flashType": "UART"
 }
