@@ -80,7 +80,7 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 
 #define FSM_TICK_MS            100
 #define BLE_CONFIRM_MS         10000
-#define BLE_ENTER_RSSI         20
+#define BLE_ENTER_RSSI         30
 #define BLE_EXIT_RSSI          60
 #define BLE_CLOSE_CONFIRM_SAMPLES 2
 #define BLE_FAR_CONFIRM_SAMPLES   6
@@ -93,7 +93,7 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 #define EXIT_DOOR_HOLD_AFTER_CLEAR_MS   5000
 #define DOOR_OPEN_TIMEOUT_MS   30000
 #define DOOR_CLOSE_TIMEOUT_MS  12000
-#define ROBOT_START_FLOOR      1
+#define ROBOT_START_FLOOR      2
 
 #define SENSOR_REED_PIN        REED_PIN
 #define SENSOR_DISTANCE_PIN    SENSOR_PIN
@@ -298,18 +298,18 @@ static void update_ble_proximity(float rssi, float stddev)
     static uint8_t close_candidate_count = 0;
     static uint8_t far_candidate_count = 0;
 
-    if (filtered_rssi_sample_count < BLE_RSSI_STABILITY_WINDOW) {
-        close_candidate_count = 0;
-        far_candidate_count = 0;
-        return;
-    }
+//    if (filtered_rssi_sample_count < BLE_RSSI_STABILITY_WINDOW) {
+//        close_candidate_count = 0;
+//        far_candidate_count = 0;
+//        return;
+//    }
 
-    if (rssi >= BLE_ENTER_RSSI) {
+    if (rssi <= BLE_ENTER_RSSI) {
         if (close_candidate_count < BLE_CLOSE_CONFIRM_SAMPLES) {
             close_candidate_count++;
         }
         far_candidate_count = 0;
-    } else if (rssi <= BLE_EXIT_RSSI) {
+    } else if (rssi >= BLE_EXIT_RSSI) {
         if (far_candidate_count < BLE_FAR_CONFIRM_SAMPLES) {
             far_candidate_count++;
         }
@@ -397,7 +397,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                 if (should_use_ble_advertisement(param->scan_rst.bda, param->scan_rst.rssi)) {
                     last_ble_rssi = param->scan_rst.rssi;
                     last_ble_adv_time_ms = now_ms();
-                    int8_t current_rssi = last_ble_rssi;
+                    int8_t current_rssi = (int8_t)abs(last_ble_rssi);
                     if (!ble_rssi_filter_initialized) {
                         filtered_ble_rssi = current_rssi;
                         ble_rssi_filter_initialized = true;
