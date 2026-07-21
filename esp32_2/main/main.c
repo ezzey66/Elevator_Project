@@ -54,7 +54,7 @@ static const size_t peer_count = sizeof(peer_macs) / sizeof(peer_macs[0]);
 static uint8_t own_mac[6] = {0};
 static bool last_path_clear = false;
 static bool last_door_sealed = false;
-static bool ble_prints_enabled = true; // set to true to re-enable BLE prints
+static bool ble_prints_enabled = false; // set to true to re-enable BLE prints
 static bool enable_ble = true; // BLE must be enabled so beacon proximity can drive the flow
 
 typedef enum {
@@ -81,11 +81,9 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 #define FSM_TICK_MS            100
 #define BLE_CONFIRM_MS         10000
 #define BLE_ENTER_RSSI         30
-#define BLE_EXIT_RSSI          40
+#define BLE_EXIT_RSSI          70
 #define BLE_CLOSE_CONFIRM_SAMPLES 2
-#define BLE_FAR_CONFIRM_SAMPLES   6
-#define BLE_CLOSE_RSSI_MAX     40
-#define BLE_FAR_RSSI_MIN       60
+#define BLE_FAR_CONFIRM_SAMPLES   2
 #define BLE_LOST_TIMEOUT_MS    4000
 #define BLE_MAX_STABLE_STDDEV  6.0f
 #define DISTANCE_CONFIRM_MS    5000
@@ -283,18 +281,30 @@ static void set_ble_proximity(ble_proximity_t new_state, float rssi, float stdde
 
 static void check_ble_timeout(void)
 {
-    if (last_ble_adv_time_ms == 0 || ble_prox == BLE_PROX_FAR) {
+    if (last_ble_adv_time_ms == 0) {
         return;
     }
 
     if ((now_ms() - last_ble_adv_time_ms) >= BLE_LOST_TIMEOUT_MS) {
-        set_ble_proximity(BLE_PROX_FAR, filtered_ble_rssi, 0.0f, "beacon timeout");
+
+        // Apenas limpa o filtro.
         reset_ble_rssi_filter();
+
+        // Evita repetir timeout em todos os ciclos.
+        last_ble_adv_time_ms = 0;
+
+        if (ble_prints_enabled) {
+            printf("[BLE] Beacon timeout. Keeping previous state.\n");
+        }
     }
 }
 
 static void update_ble_proximity(float rssi, float stddev)
 {
+    if (!ble_rssi_filter_initialized) {
+        return;
+    }
+
     static uint8_t close_candidate_count = 0;
     static uint8_t far_candidate_count = 0;
 
@@ -494,10 +504,18 @@ void app_main(void)
     } else {
         printf("[INFO] BLE disabled; only sensor outputs will be shown.\n");
     }
+
+    printf("[BLE] Waiting for first beacon...\n");
+
+    while (!ble_rssi_filter_initialized) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
     printf("[FLOW] esp32_2 initialized. Starting BLE+sensor elevator flow.\n");
 
-    elevator_state_t state = STATE_ROBOT_FAR;
-    elevator_state_t last_state = STATE_ROBOT_FAR;
+    elevator_state_t state =
+    (ble_prox == BLE_PROX_CLOSE) ? STATE_ROBOT_CLOSE : STATE_ROBOT_FAR;
+    elevator_state_t last_state = state;
     uint8_t current_floor = ROBOT_START_FLOOR;
     uint8_t destination_floor = other_floor(current_floor);
     uint32_t door_open_wait_ms = 0;
@@ -508,7 +526,8 @@ void app_main(void)
     bool entry_robot_seen = false;
     bool exit_clear_timer_started = false;
 
-    printf("[FLOW] State changed: ROBOT_FAR\n");
+    printf("[FLOW] Initial state: %s\n",
+       state == STATE_ROBOT_CLOSE ? "ROBOT_CLOSE" : "ROBOT_FAR");
 
     while (1) {
         check_ble_timeout();
