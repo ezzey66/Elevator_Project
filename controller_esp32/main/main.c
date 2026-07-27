@@ -62,7 +62,7 @@ typedef enum {
     ESPNOW_EVENT_TYPE_UNKNOWN = 0,
     ESPNOW_EVENT_TYPE_SERVICE_MODE_ON,
     ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF,
-    ESPNOW_EVENT_TYPE_CALL_FLOOR,
+    EVENT_REQUEST_ELEVATOR,
     ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN,
     ESPNOW_EVENT_TYPE_RELEASE_DOOR,
     ESPNOW_EVENT_TYPE_ROBOT_READY,
@@ -79,7 +79,7 @@ static const char *espnow_event_type_to_string(espnow_event_type_t event_type)
     switch (event_type) {
         case ESPNOW_EVENT_TYPE_SERVICE_MODE_ON: return "SERVICE_MODE_ON";
         case ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF: return "SERVICE_MODE_OFF";
-        case ESPNOW_EVENT_TYPE_CALL_FLOOR: return "CALL_FLOOR";
+        case EVENT_REQUEST_ELEVATOR: return "REQUEST_ELEVATOR";
         case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN: return "HOLD_DOOR_OPEN";
         case ESPNOW_EVENT_TYPE_RELEASE_DOOR: return "RELEASE_DOOR";
         case ESPNOW_EVENT_TYPE_ROBOT_READY: return "ROBOT_READY";
@@ -109,7 +109,7 @@ static bool handle_event(espnow_event_type_t event_type, uint8_t floor_id)
             printf("[CTRL] Service mode OFF.\n");
             set_service_mode(false);
             return true;
-        case ESPNOW_EVENT_TYPE_CALL_FLOOR:
+        case EVENT_REQUEST_ELEVATOR:
             if (floor_id == 1) {
                 printf("[CTRL] Floor 1 requested.\n");
                 pulse_floor_1_requested = true;
@@ -119,7 +119,7 @@ static bool handle_event(espnow_event_type_t event_type, uint8_t floor_id)
                 pulse_floor_2_requested = true;
                 return true;
             }
-            printf("[ESP-NOW] Invalid floor_id for CALL_FLOOR: %u\n", floor_id);
+            printf("[ESP-NOW] Invalid floor_id for REQUEST_ELEVATOR: %u\n", floor_id);
             return false;
         case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN:
             printf("[CTRL] Holding door open.\n");
@@ -156,9 +156,9 @@ static bool process_incoming_command(const char *command)
     } else if (strcmp(command, CMD_SERVICE_MODE_OFF) == 0) {
         return handle_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, 0);
     } else if (strcmp(command, CMD_CALL_FLOOR_1) == 0) {
-        return handle_event(ESPNOW_EVENT_TYPE_CALL_FLOOR, 1);
+        return handle_event(EVENT_REQUEST_ELEVATOR, 1);
     } else if (strcmp(command, CMD_CALL_FLOOR_2) == 0) {
-        return handle_event(ESPNOW_EVENT_TYPE_CALL_FLOOR, 2);
+        return handle_event(EVENT_REQUEST_ELEVATOR, 2);
     } else if (strcmp(command, CMD_HOLD_DOOR_OPEN) == 0) {
         return handle_event(ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN, 0);
     } else if (strcmp(command, CMD_RELEASE_DOOR) == 0) {
@@ -178,13 +178,13 @@ static bool send_espnow_event(espnow_event_type_t event_type, uint8_t floor_id)
             return send_command_to_robot(CMD_SERVICE_MODE_ON);
         case ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF:
             return send_command_to_robot(CMD_SERVICE_MODE_OFF);
-        case ESPNOW_EVENT_TYPE_CALL_FLOOR:
+        case EVENT_REQUEST_ELEVATOR:
             if (floor_id == 1) {
                 return send_command_to_robot(CMD_CALL_FLOOR_1);
             } else if (floor_id == 2) {
                 return send_command_to_robot(CMD_CALL_FLOOR_2);
             }
-            printf("[ESP-NOW] Invalid floor_id for event CALL_FLOOR: %u\n", floor_id);
+            printf("[ESP-NOW] Invalid floor_id for event REQUEST_ELEVATOR: %u\n", floor_id);
             return false;
         case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN:
             return send_command_to_robot(CMD_HOLD_DOOR_OPEN);
