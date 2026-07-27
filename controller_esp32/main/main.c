@@ -98,51 +98,77 @@ static bool parse_espnow_message(const uint8_t *data, int len, espnow_message_t 
     return (message->event_type != ESPNOW_EVENT_TYPE_UNKNOWN);
 }
 
+static bool handle_event(espnow_event_type_t event_type, uint8_t floor_id)
+{
+    switch (event_type) {
+        case ESPNOW_EVENT_TYPE_SERVICE_MODE_ON:
+            printf("[CTRL] Service mode ON.\n");
+            set_service_mode(true);
+            return true;
+        case ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF:
+            printf("[CTRL] Service mode OFF.\n");
+            set_service_mode(false);
+            return true;
+        case ESPNOW_EVENT_TYPE_CALL_FLOOR:
+            if (floor_id == 1) {
+                printf("[CTRL] Floor 1 requested.\n");
+                pulse_floor_1_requested = true;
+                return true;
+            } else if (floor_id == 2) {
+                printf("[CTRL] Floor 2 requested.\n");
+                pulse_floor_2_requested = true;
+                return true;
+            }
+            printf("[ESP-NOW] Invalid floor_id for CALL_FLOOR: %u\n", floor_id);
+            return false;
+        case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN:
+            printf("[CTRL] Holding door open.\n");
+            set_door_hold(true);
+            return true;
+        case ESPNOW_EVENT_TYPE_RELEASE_DOOR:
+            printf("[CTRL] Releasing door hold.\n");
+            set_door_hold(false);
+            return true;
+        case ESPNOW_EVENT_TYPE_ROBOT_READY:
+            printf("[CTRL] Robot reported ready.\n");
+            return true;
+        case ESPNOW_EVENT_TYPE_CONTROLLER_READY:
+            printf("[CTRL] Controller ready event received.\n");
+            return true;
+        default:
+            printf("[ESP-NOW] Unknown event type: %s\n", espnow_event_type_to_string(event_type));
+            return false;
+    }
+}
+
 static bool process_incoming_espnow_message(const espnow_message_t *message)
 {
     if (message == NULL) {
         return false;
     }
+    return handle_event(message->event_type, message->floor_id);
+}
 
-    switch (message->event_type) {
-        case ESPNOW_EVENT_TYPE_SERVICE_MODE_ON:
-            printf("[CTRL] Service mode ON (structured message).\n");
-            set_service_mode(true);
-            return true;
-        case ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF:
-            printf("[CTRL] Service mode OFF (structured message).\n");
-            set_service_mode(false);
-            return true;
-        case ESPNOW_EVENT_TYPE_CALL_FLOOR:
-            if (message->floor_id == 1) {
-                printf("[CTRL] Floor 1 requested (structured message).\n");
-                pulse_floor_1_requested = true;
-                return true;
-            } else if (message->floor_id == 2) {
-                printf("[CTRL] Floor 2 requested (structured message).\n");
-                pulse_floor_2_requested = true;
-                return true;
-            }
-            printf("[ESP-NOW] Invalid floor_id in structured message: %u\n", message->floor_id);
-            return false;
-        case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN:
-            printf("[CTRL] Holding door open (structured message).\n");
-            set_door_hold(true);
-            return true;
-        case ESPNOW_EVENT_TYPE_RELEASE_DOOR:
-            printf("[CTRL] Releasing door hold (structured message).\n");
-            set_door_hold(false);
-            return true;
-        case ESPNOW_EVENT_TYPE_ROBOT_READY:
-            printf("[CTRL] Robot reported ready (structured message).\n");
-            return true;
-        case ESPNOW_EVENT_TYPE_CONTROLLER_READY:
-            printf("[CTRL] Controller ready event received (structured message).\n");
-            return true;
-        default:
-            printf("[ESP-NOW] Unknown structured event type: %s\n", espnow_event_type_to_string(message->event_type));
-            return false;
+static bool process_incoming_command(const char *command)
+{
+    if (strcmp(command, CMD_SERVICE_MODE_ON) == 0) {
+        return handle_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_ON, 0);
+    } else if (strcmp(command, CMD_SERVICE_MODE_OFF) == 0) {
+        return handle_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, 0);
+    } else if (strcmp(command, CMD_CALL_FLOOR_1) == 0) {
+        return handle_event(ESPNOW_EVENT_TYPE_CALL_FLOOR, 1);
+    } else if (strcmp(command, CMD_CALL_FLOOR_2) == 0) {
+        return handle_event(ESPNOW_EVENT_TYPE_CALL_FLOOR, 2);
+    } else if (strcmp(command, CMD_HOLD_DOOR_OPEN) == 0) {
+        return handle_event(ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN, 0);
+    } else if (strcmp(command, CMD_RELEASE_DOOR) == 0) {
+        return handle_event(ESPNOW_EVENT_TYPE_RELEASE_DOOR, 0);
+    } else if (strcmp(command, CMD_ROBOT_READY) == 0) {
+        return handle_event(ESPNOW_EVENT_TYPE_ROBOT_READY, 0);
     }
+
+    printf("[ESP-NOW] Unknown controller command: %s\n", command);
+    return false;
 }
 
 static bool send_espnow_event(espnow_event_type_t event_type, uint8_t floor_id)
@@ -263,32 +289,6 @@ static void set_door_hold(bool active)
                        service_mode_active ? CTRL_SERVICE_ACTIVE : CTRL_IDLE;
 }
 
-static void process_incoming_command(const char *command)
-{
-    if (strcmp(command, CMD_SERVICE_MODE_ON) == 0) {
-        printf("[CTRL] Service mode ON.\n");
-        set_service_mode(true);
-    } else if (strcmp(command, CMD_SERVICE_MODE_OFF) == 0) {
-        printf("[CTRL] Service mode OFF.\n");
-        set_service_mode(false);
-    } else if (strcmp(command, CMD_CALL_FLOOR_1) == 0) {
-        printf("[CTRL] Floor 1 requested.\n");
-        pulse_floor_1_requested = true;
-    } else if (strcmp(command, CMD_CALL_FLOOR_2) == 0) {
-        printf("[CTRL] Floor 2 requested.\n");
-        pulse_floor_2_requested = true;
-    } else if (strcmp(command, CMD_HOLD_DOOR_OPEN) == 0) {
-        printf("[CTRL] Holding door open.\n");
-        set_door_hold(true);
-    } else if (strcmp(command, CMD_RELEASE_DOOR) == 0) {
-        printf("[CTRL] Releasing door hold.\n");
-        set_door_hold(false);
-    } else if (strcmp(command, CMD_ROBOT_READY) == 0) {
-        printf("[CTRL] Robot reported ready.\n");
-    } else {
-        printf("[ESP-NOW] Unknown controller command: %s\n", command);
-    }
-}
 
 static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
 {
