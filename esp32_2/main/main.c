@@ -91,7 +91,10 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 #define EXIT_DOOR_HOLD_AFTER_CLEAR_MS   5000
 #define DOOR_OPEN_TIMEOUT_MS   30000
 #define DOOR_CLOSE_TIMEOUT_MS  12000
-#define ROBOT_START_FLOOR      2
+
+// Configurable floor node identifier for this esp32_2 firmware.
+// Change FLOOR_ID to reuse this firmware for Floor 1 or Floor 2.
+#define FLOOR_ID               2
 
 #define SENSOR_REED_PIN        REED_PIN
 #define SENSOR_DISTANCE_PIN    SENSOR_PIN
@@ -516,7 +519,7 @@ void app_main(void)
     elevator_state_t state =
     (ble_prox == BLE_PROX_CLOSE) ? STATE_ROBOT_CLOSE : STATE_ROBOT_FAR;
     elevator_state_t last_state = state;
-    uint8_t current_floor = ROBOT_START_FLOOR;
+    uint8_t current_floor = FLOOR_ID;
     uint8_t destination_floor = other_floor(current_floor);
     uint32_t door_open_wait_ms = 0;
     uint32_t distance_confirm_ms = 0;
@@ -618,7 +621,7 @@ void app_main(void)
                 if (object_close) {
                     distance_confirm_ms += FSM_TICK_MS;
                     if (distance_confirm_ms >= DISTANCE_CONFIRM_MS) {
-                        current_floor = ROBOT_START_FLOOR;
+                        current_floor = FLOOR_ID;
                         destination_floor = other_floor(current_floor);
                         printf("[FLOW] Distance confirmed. Enabling service mode and calling floor %u.\n", current_floor);
                         send_espnow_command(CMD_SERVICE_MODE_ON);
