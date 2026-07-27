@@ -38,12 +38,12 @@ static const char *peer_names[] = {
 };
 static const size_t peer_count = sizeof(peer_macs) / sizeof(peer_macs[0]);
 static uint8_t own_mac[6] = {0};
-
+ 
 typedef enum {
-    CTRL_IDLE = 0,
-    CTRL_SERVICE_ACTIVE,
-    CTRL_DOOR_HELD,
-    CTRL_ERROR,
+   CTRL_IDLE = 0,
+   CTRL_SERVICE_ACTIVE,
+   CTRL_DOOR_HELD,
+   CTRL_ERROR,
 } controller_state_t;
 
 static volatile bool pulse_floor_1_requested = false;
@@ -53,6 +53,126 @@ static volatile bool hold_door_active = false;
 static bool last_service_mode_active = false;
 static bool last_hold_door_active = false;
 static volatile controller_state_t controller_state = CTRL_IDLE;
+
+static bool send_command_to_robot(const char *command);
+static void set_service_mode(bool active);
+static void set_door_hold(bool active);
+
+typedef enum {
+    ESPNOW_EVENT_TYPE_UNKNOWN = 0,
+    ESPNOW_EVENT_TYPE_SERVICE_MODE_ON,
+    ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF,
+    ESPNOW_EVENT_TYPE_CALL_FLOOR,
+    ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN,
+    ESPNOW_EVENT_TYPE_RELEASE_DOOR,
+    ESPNOW_EVENT_TYPE_ROBOT_READY,
+    ESPNOW_EVENT_TYPE_CONTROLLER_READY,
+} espnow_event_type_t;
+
+typedef struct {
+    espnow_event_type_t event_type;
+    uint8_t floor_id;
+} espnow_message_t;
+
+static const char *espnow_event_type_to_string(espnow_event_type_t event_type)
+{
+    switch (event_type) {
+        case ESPNOW_EVENT_TYPE_SERVICE_MODE_ON: return "SERVICE_MODE_ON";
+        case ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF: return "SERVICE_MODE_OFF";
+        case ESPNOW_EVENT_TYPE_CALL_FLOOR: return "CALL_FLOOR";
+        case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN: return "HOLD_DOOR_OPEN";
+        case ESPNOW_EVENT_TYPE_RELEASE_DOOR: return "RELEASE_DOOR";
+        case ESPNOW_EVENT_TYPE_ROBOT_READY: return "ROBOT_READY";
+        case ESPNOW_EVENT_TYPE_CONTROLLER_READY: return "CONTROLLER_READY";
+        default: return "UNKNOWN";
+    }
+}
+
+static bool parse_espnow_message(const uint8_t *data, int len, espnow_message_t *message)
+{
+    if (len != sizeof(*message) || message == NULL) {
+        return false;
+    }
+
+    memcpy(message, data, sizeof(*message));
+    return (message->event_type != ESPNOW_EVENT_TYPE_UNKNOWN);
+}
+
+static bool process_incoming_espnow_message(const espnow_message_t *message)
+{
+    if (message == NULL) {
+        return false;
+    }
+
+    switch (message->event_type) {
+        case ESPNOW_EVENT_TYPE_SERVICE_MODE_ON:
+            printf("[CTRL] Service mode ON (structured message).\n");
+            set_service_mode(true);
+            return true;
+        case ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF:
+            printf("[CTRL] Service mode OFF (structured message).\n");
+            set_service_mode(false);
+            return true;
+        case ESPNOW_EVENT_TYPE_CALL_FLOOR:
+            if (message->floor_id == 1) {
+                printf("[CTRL] Floor 1 requested (structured message).\n");
+                pulse_floor_1_requested = true;
+                return true;
+            } else if (message->floor_id == 2) {
+                printf("[CTRL] Floor 2 requested (structured message).\n");
+                pulse_floor_2_requested = true;
+                return true;
+            }
+            printf("[ESP-NOW] Invalid floor_id in structured message: %u\n", message->floor_id);
+            return false;
+        case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN:
+            printf("[CTRL] Holding door open (structured message).\n");
+            set_door_hold(true);
+            return true;
+        case ESPNOW_EVENT_TYPE_RELEASE_DOOR:
+            printf("[CTRL] Releasing door hold (structured message).\n");
+            set_door_hold(false);
+            return true;
+        case ESPNOW_EVENT_TYPE_ROBOT_READY:
+            printf("[CTRL] Robot reported ready (structured message).\n");
+            return true;
+        case ESPNOW_EVENT_TYPE_CONTROLLER_READY:
+            printf("[CTRL] Controller ready event received (structured message).\n");
+            return true;
+        default:
+            printf("[ESP-NOW] Unknown structured event type: %s\n", espnow_event_type_to_string(message->event_type));
+            return false;
+    }
+}
+
+static bool send_espnow_event(espnow_event_type_t event_type, uint8_t floor_id)
+{
+    switch (event_type) {
+        case ESPNOW_EVENT_TYPE_SERVICE_MODE_ON:
+            return send_command_to_robot(CMD_SERVICE_MODE_ON);
+        case ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF:
+            return send_command_to_robot(CMD_SERVICE_MODE_OFF);
+        case ESPNOW_EVENT_TYPE_CALL_FLOOR:
+            if (floor_id == 1) {
+                return send_command_to_robot(CMD_CALL_FLOOR_1);
+            } else if (floor_id == 2) {
+                return send_command_to_robot(CMD_CALL_FLOOR_2);
+            }
+            printf("[ESP-NOW] Invalid floor_id for event CALL_FLOOR: %u\n", floor_id);
+            return false;
+        case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN:
+            return send_command_to_robot(CMD_HOLD_DOOR_OPEN);
+        case ESPNOW_EVENT_TYPE_RELEASE_DOOR:
+            return send_command_to_robot(CMD_RELEASE_DOOR);
+        case ESPNOW_EVENT_TYPE_ROBOT_READY:
+            return send_command_to_robot(CMD_ROBOT_READY);
+        case ESPNOW_EVENT_TYPE_CONTROLLER_READY:
+            return send_command_to_robot(CMD_CONTROLLER_READY);
+        default:
+            printf("[ESP-NOW] Unsupported event type for send: %s\n", espnow_event_type_to_string(event_type));
+            return false;
+    }
+}
 
 static void print_mac(const uint8_t *mac)
 {
@@ -176,6 +296,18 @@ static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *da
         return;
     }
 
+    espnow_message_t message = {0};
+    if (parse_espnow_message(data, len, &message)) {
+        printf("[ESP-NOW] RX structured message from %02X:%02X:%02X:%02X:%02X:%02X -> %s floor=%u\n",
+               recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+               recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5],
+               espnow_event_type_to_string(message.event_type), message.floor_id);
+        if (!process_incoming_espnow_message(&message)) {
+            printf("[ESP-NOW] Failed to process structured message. Falling back to text parse.\n");
+        }
+        return;
+    }
+
     char incoming[64] = {0};
     snprintf(incoming, sizeof(incoming), "%.*s", len, data);
     printf("[ESP-NOW] RX from %02X:%02X:%02X:%02X:%02X:%02X -> %s\n",
@@ -226,7 +358,7 @@ void app_main(void)
     }
 
     relay_init();
-    send_command_to_robot(CMD_CONTROLLER_READY);
+    send_espnow_event(ESPNOW_EVENT_TYPE_CONTROLLER_READY, 0);
     printf("[CTRL] Controller online. Relay mapping: IN1 service, IN2 floor1, IN3 floor2, IN4 door hold.\n");
 
     while (1) {
