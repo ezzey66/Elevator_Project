@@ -13,9 +13,9 @@
 
 // Relay module mapping.
 // Adjust only these GPIOs if the physical wiring changes.
-#define RELAY_IN1_SERVICE_MODE_PIN GPIO_NUM_13
-#define RELAY_IN2_FLOOR_1_PIN      GPIO_NUM_12
-#define RELAY_IN3_FLOOR_2_PIN      GPIO_NUM_14
+#define RELAY_IN1_SERVICE_MODE_PIN GPIO_NUM_14
+#define RELAY_IN2_FLOOR_1_PIN      GPIO_NUM_13
+#define RELAY_IN3_FLOOR_2_PIN      GPIO_NUM_12
 #define RELAY_IN4_DOOR_HOLD_PIN    GPIO_NUM_27
 
 #define RELAY_PULSE_MS             1000

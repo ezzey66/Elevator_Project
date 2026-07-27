@@ -80,8 +80,8 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 
 #define FSM_TICK_MS            100
 #define BLE_CONFIRM_MS         10000
-#define BLE_ENTER_RSSI         30
-#define BLE_EXIT_RSSI          70
+#define BLE_ENTER_RSSI         55
+#define BLE_EXIT_RSSI          60
 #define BLE_CLOSE_CONFIRM_SAMPLES 2
 #define BLE_FAR_CONFIRM_SAMPLES   2
 #define BLE_LOST_TIMEOUT_MS    4000
