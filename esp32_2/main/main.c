@@ -37,7 +37,22 @@ static const bool use_specific_beacon = true;
 static const uint8_t target_ble_mac[6] = {0x7C, 0xD9, 0xF4, 0x08, 0xD5, 0x85};
 static uint8_t learned_ble_mac[6] = {0};
 static bool has_learned_ble_mac = false;
-static bool last_object_close = false;
+
+typedef struct {
+    uint8_t floor_id;
+    bool beacon_near;
+    bool door_open;
+    bool robot_detected;
+    bool robot_inside_elevator;
+} floor_node_state_t;
+
+static floor_node_state_t floor_state = {
+    .floor_id = FLOOR_ID,
+    .beacon_near = false,
+    .door_open = false,
+    .robot_detected = false,
+    .robot_inside_elevator = false,
+};
 
 // BLE proximity logic follows the elevator flowchart:
 // - ROBOT_CLOSE when the beacon RSSI crosses the close threshold.
@@ -52,8 +67,6 @@ static const char *peer_names[] = {
 };
 static const size_t peer_count = sizeof(peer_macs) / sizeof(peer_macs[0]);
 static uint8_t own_mac[6] = {0};
-static bool last_path_clear = false;
-static bool last_door_sealed = false;
 static bool ble_prints_enabled = false; // set to true to re-enable BLE prints
 static bool enable_ble = true; // BLE must be enabled so beacon proximity can drive the flow
 
@@ -190,8 +203,16 @@ static bool is_door_open(void)
     return !is_door_sealed();
 }
 
+static void refresh_floor_node_state(void)
+{
+    floor_state.beacon_near = is_robot_close();
+    floor_state.door_open = is_door_open();
+    floor_state.robot_detected = is_robot_detected_by_distance();
+}
+
 static void update_floor_state(void)
 {
+    refresh_floor_node_state();
     // Placeholder for future floor node state updates.
 }
 
@@ -559,15 +580,15 @@ void app_main(void)
     elevator_state_t state =
     (ble_prox == BLE_PROX_CLOSE) ? STATE_ROBOT_CLOSE : STATE_ROBOT_FAR;
     elevator_state_t last_state = state;
-    uint8_t current_floor = FLOOR_ID;
+    uint8_t current_floor = floor_state.floor_id;
     uint8_t destination_floor = other_floor(current_floor);
     uint32_t door_open_wait_ms = 0;
     uint32_t distance_confirm_ms = 0;
     uint32_t entry_door_hold_ms = 0;
     uint32_t exit_clear_hold_ms = 0;
     uint32_t door_close_wait_ms = 0;
-    bool entry_robot_seen = false;
     bool exit_clear_timer_started = false;
+    floor_node_state_t last_floor_state = floor_state;
 
     printf("[FLOW] Initial state: %s\n",
        state == STATE_ROBOT_CLOSE ? "ROBOT_CLOSE" : "ROBOT_FAR");
@@ -575,11 +596,8 @@ void app_main(void)
     while (1) {
         check_ble_timeout();
 
-        bool object_close = is_object_close();
-        bool door_sealed = is_door_sealed();
-        bool path_clear = is_path_clear();
-
         update_floor_state();
+        bool path_clear = !floor_state.robot_detected;
 
         if (state != last_state) {
             const char *name = "UNKNOWN";
@@ -602,36 +620,37 @@ void app_main(void)
             last_state = state;
         }
 
-        if (object_close != last_object_close) {
-            if (object_close) {
+        if (floor_state.robot_detected != last_floor_state.robot_detected) {
+            if (floor_state.robot_detected) {
                 printf("[SENSOR] Distance detected: object_close=1\n");
             } else {
                 printf("[SENSOR] Distance cleared: object_close=0\n");
             }
-            last_object_close = object_close;
         }
-        if (path_clear != last_path_clear) {
+
+        if (path_clear != !last_floor_state.robot_detected) {
             if (path_clear) {
                 printf("[SENSOR] Path clear: path_clear=1\n");
             } else {
                 printf("[SENSOR] Path blocked: path_clear=0\n");
             }
-            last_path_clear = path_clear;
         }
-        if (door_sealed != last_door_sealed) {
-            if (door_sealed) {
-                printf("[SENSOR] Reed activated: door_sealed=1\n");
-            } else {
+
+        if (floor_state.door_open != last_floor_state.door_open) {
+            if (floor_state.door_open) {
                 printf("[SENSOR] Reed opened: door_sealed=0\n");
+            } else {
+                printf("[SENSOR] Reed activated: door_sealed=1\n");
             }
-            last_door_sealed = door_sealed;
         }
+
+        last_floor_state = floor_state;
 
         update_robot_state();
 
         switch (state) {
             case STATE_ROBOT_FAR:
-                if (is_robot_close()) {
+                if (floor_state.beacon_near) {
                     printf("[FLOW] Robot BLE detected nearby. Confirming for %d ms.\n", BLE_CONFIRM_MS);
                     state = STATE_ROBOT_CLOSE;
                     ble_seen_ms = 0;
@@ -640,7 +659,7 @@ void app_main(void)
                 break;
 
             case STATE_ROBOT_CLOSE:
-                if (is_robot_far()) {
+                if (!floor_state.beacon_near) {
                     printf("[FLOW] Robot BLE lost. Returning to far state.\n");
                     state = STATE_ROBOT_FAR;
                     ble_seen_ms = 0;
@@ -655,17 +674,17 @@ void app_main(void)
                 break;
 
             case STATE_CONFIRM_DISTANCE:
-                if (is_robot_far()) {
+                if (!floor_state.beacon_near) {
                     printf("[FLOW] BLE robot no longer close. Returning to far state.\n");
                     state = STATE_ROBOT_FAR;
                     ble_seen_ms = 0;
                     distance_confirm_ms = 0;
                     break;
                 }
-                if (object_close) {
+                if (floor_state.robot_detected) {
                     distance_confirm_ms += FSM_TICK_MS;
                     if (distance_confirm_ms >= DISTANCE_CONFIRM_MS) {
-                        current_floor = FLOOR_ID;
+                        current_floor = floor_state.floor_id;
                         destination_floor = other_floor(current_floor);
                         printf("[FLOW] Distance confirmed. Enabling service mode and calling floor %u.\n", current_floor);
                         send_floor_event(CMD_SERVICE_MODE_ON);
@@ -685,13 +704,13 @@ void app_main(void)
                 break;
 
             case STATE_WAIT_ENTRY_DOOR_OPEN:
-                if (!door_sealed) {
+                if (floor_state.door_open) {
                     printf("[FLOW] Entry door opened. Holding door open while robot enters.\n");
                     send_floor_event(CMD_HOLD_DOOR_OPEN);
                     state = STATE_WAIT_ROBOT_ENTERED;
                     door_open_wait_ms = 0;
                     entry_door_hold_ms = 0;
-                    entry_robot_seen = false;
+                    floor_state.robot_inside_elevator = false;
                 } else {
                     door_open_wait_ms += FSM_TICK_MS;
                     if (door_open_wait_ms >= DOOR_OPEN_TIMEOUT_MS) {
@@ -702,18 +721,18 @@ void app_main(void)
                 break;
 
             case STATE_WAIT_ROBOT_ENTERED:
-                if (object_close && !entry_robot_seen) {
+                if (floor_state.robot_detected && !floor_state.robot_inside_elevator) {
                     printf("[FLOW] Robot detected entering. Holding door for at least %d ms.\n",
                            ENTRY_DOOR_HOLD_AFTER_DETECT_MS);
-                    entry_robot_seen = true;
+                    floor_state.robot_inside_elevator = true;
                     entry_door_hold_ms = 0;
                 }
 
-                if (entry_robot_seen && entry_door_hold_ms < ENTRY_DOOR_HOLD_AFTER_DETECT_MS) {
+                if (floor_state.robot_inside_elevator && entry_door_hold_ms < ENTRY_DOOR_HOLD_AFTER_DETECT_MS) {
                     entry_door_hold_ms += FSM_TICK_MS;
                 }
 
-                if (entry_robot_seen &&
+                if (floor_state.robot_inside_elevator &&
                     entry_door_hold_ms >= ENTRY_DOOR_HOLD_AFTER_DETECT_MS &&
                     path_clear) {
                     printf("[FLOW] Robot entered and hold delay elapsed. Releasing door hold so entry door can close.\n");
@@ -725,7 +744,7 @@ void app_main(void)
                 break;
 
             case STATE_WAIT_ENTRY_DOOR_CLOSED:
-                if (door_sealed) {
+                if (!floor_state.door_open) {
                     printf("[FLOW] Entry door closed. Calling destination floor %u.\n", destination_floor);
                     state = STATE_CALL_DESTINATION_FLOOR;
                     door_close_wait_ms = 0;
@@ -745,7 +764,7 @@ void app_main(void)
                 break;
 
             case STATE_WAIT_EXIT_DOOR_OPEN:
-                if (!door_sealed) {
+                if (floor_state.door_open) {
                     printf("[FLOW] Exit door opened. Holding door open while robot exits.\n");
                     send_floor_event(CMD_HOLD_DOOR_OPEN);
                     state = STATE_WAIT_ROBOT_EXIT_DETECTED;
@@ -762,7 +781,7 @@ void app_main(void)
                 break;
 
             case STATE_WAIT_ROBOT_EXIT_DETECTED:
-                if (object_close) {
+                if (floor_state.robot_detected) {
                     printf("[FLOW] Robot detected outside elevator. Waiting until path clears.\n");
                     state = STATE_WAIT_ROBOT_EXIT_CLEAR;
                 }
@@ -800,13 +819,13 @@ void app_main(void)
                 break;
 
             case STATE_FINISHED:
-                if (door_sealed || door_close_wait_ms >= DOOR_CLOSE_TIMEOUT_MS) {
+                if (!floor_state.door_open || door_close_wait_ms >= DOOR_CLOSE_TIMEOUT_MS) {
                     printf("[FLOW] Process finished. Current floor is now %u.\n", current_floor);
                     state = STATE_ROBOT_FAR;
                     ble_seen_ms = 0;
                     distance_confirm_ms = 0;
                     entry_door_hold_ms = 0;
-                    entry_robot_seen = false;
+                    floor_state.robot_inside_elevator = false;
                     exit_clear_hold_ms = 0;
                     exit_clear_timer_started = false;
                     door_close_wait_ms = 0;
@@ -824,7 +843,7 @@ void app_main(void)
                 distance_confirm_ms = 0;
                 door_open_wait_ms = 0;
                 entry_door_hold_ms = 0;
-                entry_robot_seen = false;
+                floor_state.robot_inside_elevator = false;
                 exit_clear_hold_ms = 0;
                 exit_clear_timer_started = false;
                 door_close_wait_ms = 0;
