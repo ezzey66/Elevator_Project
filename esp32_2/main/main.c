@@ -289,6 +289,9 @@ static void update_floor_mission(void)
 {
     switch (floor_state.mission_state) {
         case FLOOR_MISSION_IDLE:
+            if (is_robot_close() && is_robot_detected_by_distance()) {
+                floor_state.mission_state = FLOOR_MISSION_WAIT_REQUEST_CONFIRMATION;
+            }
             break;
         case FLOOR_MISSION_WAIT_REQUEST_CONFIRMATION:
             break;
