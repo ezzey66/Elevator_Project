@@ -45,12 +45,23 @@ static const uint8_t target_ble_mac[6] = {0x7C, 0xD9, 0xF4, 0x08, 0xD5, 0x85};
 static uint8_t learned_ble_mac[6] = {0};
 static bool has_learned_ble_mac = false;
 
+typedef enum {
+    FLOOR_MISSION_IDLE = 0,
+    FLOOR_MISSION_WAIT_REQUEST_CONFIRMATION,
+    FLOOR_MISSION_WAIT_ELEVATOR,
+    FLOOR_MISSION_WAIT_DOOR_OPEN,
+    FLOOR_MISSION_WAIT_ROBOT_PASSAGE,
+    FLOOR_MISSION_WAIT_DOOR_CLOSE,
+    FLOOR_MISSION_COMPLETE,
+} floor_mission_state_t;
+
 typedef struct {
     uint8_t floor_id;
     bool beacon_near;
     bool door_open;
     bool robot_detected;
     bool robot_inside_elevator;
+    floor_mission_state_t mission_state;
 } floor_node_state_t;
 
 static floor_node_state_t floor_state = {
@@ -59,6 +70,7 @@ static floor_node_state_t floor_state = {
     .door_open = false,
     .robot_detected = false,
     .robot_inside_elevator = false,
+    .mission_state = FLOOR_MISSION_IDLE,
 };
 
 // BLE proximity logic follows the elevator flowchart:
@@ -271,6 +283,26 @@ static void update_floor_state(void)
 static void update_robot_state(void)
 {
     // Placeholder for future robot state tracking updates.
+}
+
+static void update_floor_mission(void)
+{
+    switch (floor_state.mission_state) {
+        case FLOOR_MISSION_IDLE:
+            break;
+        case FLOOR_MISSION_WAIT_REQUEST_CONFIRMATION:
+            break;
+        case FLOOR_MISSION_WAIT_ELEVATOR:
+            break;
+        case FLOOR_MISSION_WAIT_DOOR_OPEN:
+            break;
+        case FLOOR_MISSION_WAIT_ROBOT_PASSAGE:
+            break;
+        case FLOOR_MISSION_WAIT_DOOR_CLOSE:
+            break;
+        case FLOOR_MISSION_COMPLETE:
+            break;
+    }
 }
 
 static uint8_t other_floor(uint8_t floor)
@@ -730,6 +762,7 @@ void app_main(void)
         check_ble_timeout();
 
         update_floor_state();
+        update_floor_mission();
         bool path_clear = !floor_state.robot_detected;
 
         if (state != last_state) {
