@@ -78,6 +78,22 @@ static bool ble_prints_enabled = false; // set to true to re-enable BLE prints
 static bool enable_ble = true; // BLE must be enabled so beacon proximity can drive the flow
 
 typedef enum {
+    ESPNOW_EVENT_TYPE_UNKNOWN = 0,
+    ESPNOW_EVENT_TYPE_SERVICE_MODE_ON,
+    ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF,
+    EVENT_REQUEST_ELEVATOR,
+    ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN,
+    ESPNOW_EVENT_TYPE_RELEASE_DOOR,
+    ESPNOW_EVENT_TYPE_ROBOT_READY,
+    ESPNOW_EVENT_TYPE_CONTROLLER_READY,
+} espnow_event_type_t;
+
+typedef struct {
+    espnow_event_type_t event_type;
+    uint8_t floor_id;
+} espnow_message_t;
+
+typedef enum {
     ROBOT_FAR,
     ROBOT_CLOSE,
     ROBOT_WAITING_FOR_ELEVATOR,
@@ -161,27 +177,57 @@ static bool add_peer(const uint8_t *mac, const char *name)
     return true;
 }
 
-static bool send_espnow_command(const char *command)
+static const char *espnow_event_type_to_string(espnow_event_type_t event_type)
 {
-    if (peer_count == 0) {
-        printf("[ESP-NOW] No peer configured, cannot send: %s\n", command);
+    switch (event_type) {
+        case ESPNOW_EVENT_TYPE_SERVICE_MODE_ON: return "SERVICE_MODE_ON";
+        case ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF: return "SERVICE_MODE_OFF";
+        case EVENT_REQUEST_ELEVATOR: return "REQUEST_ELEVATOR";
+        case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN: return "HOLD_DOOR_OPEN";
+        case ESPNOW_EVENT_TYPE_RELEASE_DOOR: return "RELEASE_DOOR";
+        case ESPNOW_EVENT_TYPE_ROBOT_READY: return "ROBOT_READY";
+        case ESPNOW_EVENT_TYPE_CONTROLLER_READY: return "CONTROLLER_READY";
+        default: return "UNKNOWN";
+    }
+}
+
+static bool parse_espnow_message(const uint8_t *data, int len, espnow_message_t *message)
+{
+    if (message == NULL || len != sizeof(*message)) {
         return false;
     }
 
-    esp_err_t err = esp_now_send(peer_macs[0], (const uint8_t *)command, strlen(command));
-    if (err != ESP_OK) {
-        printf("[ESP-NOW] Failed to send %s (err=%d)\n", command, err);
+    memcpy(message, data, sizeof(*message));
+    return (message->event_type != ESPNOW_EVENT_TYPE_UNKNOWN);
+}
+
+static bool send_espnow_event(espnow_event_type_t event_type, uint8_t floor_id)
+{
+    if (peer_count == 0) {
+        printf("[ESP-NOW] No peer configured, cannot send event %s\n", espnow_event_type_to_string(event_type));
         return false;
     }
-    printf("[ESP-NOW] Sent: %s -> ", command);
+
+    espnow_message_t message = {
+        .event_type = event_type,
+        .floor_id = floor_id,
+    };
+
+    esp_err_t err = esp_now_send(peer_macs[0], (const uint8_t *)&message, sizeof(message));
+    if (err != ESP_OK) {
+        printf("[ESP-NOW] Failed to send event %s (err=%d)\n", espnow_event_type_to_string(event_type), err);
+        return false;
+    }
+
+    printf("[ESP-NOW] Sent event %s floor=%u -> ", espnow_event_type_to_string(event_type), floor_id);
     print_mac(peer_macs[0]);
     printf("\n");
     return true;
 }
 
-static bool send_floor_event(const char *command)
+static bool send_floor_event(espnow_event_type_t event_type, uint8_t floor_id)
 {
-    return send_espnow_command(command);
+    return send_espnow_event(event_type, floor_id);
 }
 
 static bool ble_advertisement_is_relevant(const uint8_t *addr, int8_t rssi)
@@ -230,11 +276,6 @@ static void update_robot_state(void)
 static uint8_t other_floor(uint8_t floor)
 {
     return (floor == 1) ? 2 : 1;
-}
-
-static const char *floor_command(uint8_t floor)
-{
-    return (floor == 1) ? CMD_CALL_FLOOR_1 : CMD_CALL_FLOOR_2;
 }
 
 static bool ble_addr_matches(const uint8_t *addr, const uint8_t *target)
@@ -286,15 +327,76 @@ static bool is_door_sealed(void)
     return is_magnet_present();
 }
 
-static void process_controller_command(const char *command)
+static bool process_incoming_espnow_message(const espnow_message_t *message)
 {
+    if (message == NULL) {
+        return false;
+    }
+
+    switch (message->event_type) {
+        case ESPNOW_EVENT_TYPE_SERVICE_MODE_ON:
+            printf("[ESP-NOW] Controller requested service mode ON.\n");
+            return true;
+        case ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF:
+            printf("[ESP-NOW] Controller requested service mode OFF.\n");
+            return true;
+        case EVENT_REQUEST_ELEVATOR:
+            printf("[ESP-NOW] Controller requested elevator for floor %u.\n", message->floor_id);
+            return true;
+        case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN:
+            printf("[ESP-NOW] Controller requested door hold.\n");
+            return true;
+        case ESPNOW_EVENT_TYPE_RELEASE_DOOR:
+            printf("[ESP-NOW] Controller requested door release.\n");
+            return true;
+        case ESPNOW_EVENT_TYPE_ROBOT_READY:
+            printf("[ESP-NOW] Controller acknowledged robot ready.\n");
+            return true;
+        case ESPNOW_EVENT_TYPE_CONTROLLER_READY:
+            printf("[ESP-NOW] Controller ready event received.\n");
+            return true;
+        default:
+            printf("[ESP-NOW] Unsupported structured event type: %s\n", espnow_event_type_to_string(message->event_type));
+            return false;
+    }
+}
+
+static bool process_controller_command(const char *command)
+{
+    if (strcmp(command, CMD_SERVICE_MODE_ON) == 0) {
+        return process_incoming_espnow_message(&(espnow_message_t){ .event_type = ESPNOW_EVENT_TYPE_SERVICE_MODE_ON, .floor_id = floor_state.floor_id });
+    } else if (strcmp(command, CMD_SERVICE_MODE_OFF) == 0) {
+        return process_incoming_espnow_message(&(espnow_message_t){ .event_type = ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, .floor_id = floor_state.floor_id });
+    } else if (strcmp(command, CMD_CALL_FLOOR_1) == 0) {
+        return process_incoming_espnow_message(&(espnow_message_t){ .event_type = EVENT_REQUEST_ELEVATOR, .floor_id = 1 });
+    } else if (strcmp(command, CMD_CALL_FLOOR_2) == 0) {
+        return process_incoming_espnow_message(&(espnow_message_t){ .event_type = EVENT_REQUEST_ELEVATOR, .floor_id = 2 });
+    } else if (strcmp(command, CMD_HOLD_DOOR_OPEN) == 0) {
+        return process_incoming_espnow_message(&(espnow_message_t){ .event_type = ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN, .floor_id = floor_state.floor_id });
+    } else if (strcmp(command, CMD_RELEASE_DOOR) == 0) {
+        return process_incoming_espnow_message(&(espnow_message_t){ .event_type = ESPNOW_EVENT_TYPE_RELEASE_DOOR, .floor_id = floor_state.floor_id });
+    } else if (strcmp(command, CMD_ROBOT_READY) == 0) {
+        return process_incoming_espnow_message(&(espnow_message_t){ .event_type = ESPNOW_EVENT_TYPE_ROBOT_READY, .floor_id = floor_state.floor_id });
+    }
+
     printf("[ESP-NOW] Controller command received: %s\n", command);
+    return false;
 }
 
 // Original receiver callback signature used by some IDF versions.
 static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
 {
     if (len <= 0 || len >= 64) {
+        return;
+    }
+
+    espnow_message_t message = {0};
+    if (parse_espnow_message(data, len, &message)) {
+        printf("[ESP-NOW] RX structured event from %02X:%02X:%02X:%02X:%02X:%02X -> %s floor=%u\n",
+               recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+               recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5],
+               espnow_event_type_to_string(message.event_type), message.floor_id);
+        process_incoming_espnow_message(&message);
         return;
     }
 
@@ -575,7 +677,7 @@ void app_main(void)
     }
 
     // Send a startup handshake so the controller knows ESP-NOW is ready.
-    send_floor_event(CMD_ROBOT_READY);
+    send_floor_event(ESPNOW_EVENT_TYPE_ROBOT_READY, floor_state.floor_id);
 
     init_sensor_pins();
     {
@@ -718,8 +820,8 @@ void app_main(void)
                         current_floor = floor_state.floor_id;
                         destination_floor = other_floor(current_floor);
                         printf("[FLOW] Distance confirmed. Enabling service mode and calling floor %u.\n", current_floor);
-                        send_floor_event(CMD_SERVICE_MODE_ON);
-                        send_floor_event(floor_command(current_floor));
+                        send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_ON, floor_state.floor_id);
+                        send_floor_event(EVENT_REQUEST_ELEVATOR, current_floor);
                         state = STATE_WAIT_ENTRY_DOOR_OPEN;
                         door_open_wait_ms = 0;
                     }
@@ -729,7 +831,7 @@ void app_main(void)
                 break;
 
             case STATE_CALL_ORIGIN_FLOOR:
-                send_floor_event(floor_command(current_floor));
+                send_floor_event(EVENT_REQUEST_ELEVATOR, current_floor);
                 state = STATE_WAIT_ENTRY_DOOR_OPEN;
                 door_open_wait_ms = 0;
                 break;
@@ -737,7 +839,7 @@ void app_main(void)
             case STATE_WAIT_ENTRY_DOOR_OPEN:
                 if (floor_state.door_open) {
                     printf("[FLOW] Entry door opened. Holding door open while robot enters.\n");
-                    send_floor_event(CMD_HOLD_DOOR_OPEN);
+                    send_floor_event(ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN, floor_state.floor_id);
                     state = STATE_WAIT_ROBOT_ENTERED;
                     door_open_wait_ms = 0;
                     entry_door_hold_ms = 0;
@@ -767,7 +869,7 @@ void app_main(void)
                     entry_door_hold_ms >= ENTRY_DOOR_HOLD_AFTER_DETECT_MS &&
                     path_clear) {
                     printf("[FLOW] Robot entered and hold delay elapsed. Releasing door hold so entry door can close.\n");
-                    send_floor_event(CMD_RELEASE_DOOR);
+                    send_floor_event(ESPNOW_EVENT_TYPE_RELEASE_DOOR, floor_state.floor_id);
                     state = STATE_WAIT_ENTRY_DOOR_CLOSED;
                     door_close_wait_ms = 0;
                     entry_door_hold_ms = 0;
@@ -789,7 +891,7 @@ void app_main(void)
                 break;
 
             case STATE_CALL_DESTINATION_FLOOR:
-                send_floor_event(floor_command(destination_floor));
+                send_floor_event(EVENT_REQUEST_ELEVATOR, destination_floor);
                 state = STATE_WAIT_EXIT_DOOR_OPEN;
                 door_open_wait_ms = 0;
                 break;
@@ -797,7 +899,7 @@ void app_main(void)
             case STATE_WAIT_EXIT_DOOR_OPEN:
                 if (floor_state.door_open) {
                     printf("[FLOW] Exit door opened. Holding door open while robot exits.\n");
-                    send_floor_event(CMD_HOLD_DOOR_OPEN);
+                    send_floor_event(ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN, floor_state.floor_id);
                     state = STATE_WAIT_ROBOT_EXIT_DETECTED;
                     door_open_wait_ms = 0;
                     exit_clear_hold_ms = 0;
@@ -838,8 +940,8 @@ void app_main(void)
                 if (exit_clear_timer_started &&
                     exit_clear_hold_ms >= EXIT_DOOR_HOLD_AFTER_CLEAR_MS) {
                     printf("[FLOW] Exit hold delay elapsed. Releasing door and disabling service mode.\n");
-                    send_floor_event(CMD_RELEASE_DOOR);
-                    send_floor_event(CMD_SERVICE_MODE_OFF);
+                    send_floor_event(ESPNOW_EVENT_TYPE_RELEASE_DOOR, floor_state.floor_id);
+                    send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, floor_state.floor_id);
                     current_floor = destination_floor;
                     destination_floor = other_floor(current_floor);
                     state = STATE_FINISHED;
@@ -867,8 +969,8 @@ void app_main(void)
 
             case STATE_ERROR_STUCK:
                 printf("[FSM] ERROR_STUCK: releasing door and disabling service mode for safety.\n");
-                send_floor_event(CMD_RELEASE_DOOR);
-                send_floor_event(CMD_SERVICE_MODE_OFF);
+                send_floor_event(ESPNOW_EVENT_TYPE_RELEASE_DOOR, floor_state.floor_id);
+                send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, floor_state.floor_id);
                 state = STATE_ROBOT_FAR;
                 ble_seen_ms = 0;
                 distance_confirm_ms = 0;
