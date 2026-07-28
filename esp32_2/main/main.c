@@ -62,6 +62,7 @@ typedef struct {
     bool robot_detected;
     bool robot_inside_elevator;
     bool mission_request_confirmed;
+    bool elevator_request_sent;
     floor_mission_state_t mission_state;
 } floor_node_state_t;
 
@@ -72,6 +73,7 @@ static floor_node_state_t floor_state = {
     .robot_detected = false,
     .robot_inside_elevator = false,
     .mission_request_confirmed = false,
+    .elevator_request_sent = false,
     .mission_state = FLOOR_MISSION_IDLE,
 };
 
@@ -293,15 +295,22 @@ static void update_floor_mission(void)
         case FLOOR_MISSION_IDLE:
             if (is_robot_close() && is_robot_detected_by_distance()) {
                 floor_state.mission_request_confirmed = false;
+                floor_state.elevator_request_sent = false;
                 floor_state.mission_state = FLOOR_MISSION_WAIT_REQUEST_CONFIRMATION;
             }
             break;
         case FLOOR_MISSION_WAIT_REQUEST_CONFIRMATION:
             if (!is_robot_close() || !is_robot_detected_by_distance()) {
                 floor_state.mission_request_confirmed = false;
+                floor_state.elevator_request_sent = false;
                 floor_state.mission_state = FLOOR_MISSION_IDLE;
             } else if (ble_seen_ms >= BLE_CONFIRM_MS) {
                 floor_state.mission_request_confirmed = true;
+                if (!floor_state.elevator_request_sent) {
+                    send_espnow_event(EVENT_REQUEST_ELEVATOR, floor_state.floor_id);
+                    floor_state.elevator_request_sent = true;
+                    floor_state.mission_state = FLOOR_MISSION_WAIT_ELEVATOR;
+                }
             }
             break;
         case FLOOR_MISSION_WAIT_ELEVATOR:
