@@ -142,7 +142,7 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 #define DOOR_OPEN_TIMEOUT_MS   30000
 #define DOOR_CLOSE_TIMEOUT_MS  12000
 
-// Configurable floor node identifier for this esp32_2 firmware.
+// Configurable floor node identifier for this firmware.
 // Change FLOOR_ID to reuse this firmware for Floor 1 or Floor 2.
 
 #define SENSOR_REED_PIN        REED_PIN
