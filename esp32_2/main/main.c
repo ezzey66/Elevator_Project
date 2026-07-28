@@ -21,6 +21,13 @@
 
 #include <math.h>
 
+static bool should_use_ble_advertisement(const uint8_t *addr, int8_t rssi);
+static void update_ble_proximity(float rssi, float stddev);
+static bool is_door_sealed(void);
+static bool is_robot_close(void);
+
+#define FLOOR_ID               2
+
 static int8_t last_ble_rssi = -127;
 static float filtered_ble_rssi = 0.0f;
 static bool ble_rssi_filter_initialized = false;
@@ -107,7 +114,6 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 
 // Configurable floor node identifier for this esp32_2 firmware.
 // Change FLOOR_ID to reuse this firmware for Floor 1 or Floor 2.
-#define FLOOR_ID               2
 
 #define SENSOR_REED_PIN        REED_PIN
 #define SENSOR_DISTANCE_PIN    SENSOR_PIN
@@ -285,6 +291,7 @@ static void process_controller_command(const char *command)
     printf("[ESP-NOW] Controller command received: %s\n", command);
 }
 
+// Original receiver callback signature used by some IDF versions.
 static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
 {
     if (len <= 0 || len >= 64) {
@@ -299,6 +306,30 @@ static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *da
            incoming);
 
     process_controller_command(incoming);
+}
+
+// Compatibility wrapper for IDF versions that use the older simple MAC-based recv callback.
+static void on_data_recv_v1(const uint8_t *mac_addr, const uint8_t *data, int len)
+{
+    if (len <= 0 || len >= 64) {
+        return;
+    }
+
+    esp_now_recv_info_t info;
+    memset(&info, 0, sizeof(info));
+    if (mac_addr != NULL) {
+        memcpy(info.src_addr, mac_addr, ESP_NOW_ETH_ALEN);
+    }
+
+    // Forward to the main handler that expects esp_now_recv_info_t.
+    on_data_recv(&info, data, len);
+}
+
+// Compatibility wrapper for IDF versions that use the older send callback signature.
+static void espnow_send_cb_v1(const uint8_t *mac_addr, esp_now_send_status_t status)
+{
+    (void)mac_addr;
+    printf("[ESP-NOW] send callback invoked, status=%d\n", status);
 }
 
 static bool is_robot_far(void)
