@@ -314,6 +314,9 @@ static void update_floor_mission(void)
             }
             break;
         case FLOOR_MISSION_WAIT_ELEVATOR:
+            if (floor_state.door_open) {
+                floor_state.mission_state = FLOOR_MISSION_WAIT_DOOR_OPEN;
+            }
             break;
         case FLOOR_MISSION_WAIT_DOOR_OPEN:
             break;
