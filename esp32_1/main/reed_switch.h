@@ -3,8 +3,8 @@
 
 #include <stdbool.h>
 
-// Reed switch on GPIO 4 (D4)
-#define REED_PIN 4
+// Reed switch on GPIO 15 (D15)
+#define REED_PIN 15
 
 void init_reed_switch(void);
 bool is_magnet_present(void);

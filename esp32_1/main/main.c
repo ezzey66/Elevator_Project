@@ -28,9 +28,8 @@ static bool is_robot_close(void);
 
 #define FLOOR_ID               1
 
-// Dedicated destination firmware for Floor 1: disable origin-initiated mission behavior.
-// is_origin == true means this node may initiate missions (only false for FLOOR_ID==1 here).
-static const bool is_origin = (FLOOR_ID != 1);
+// Floor 1 acts as a destination board and does not initiate elevator requests.
+static const bool is_origin = false;
 
 // When a controller requests this floor, mission_requested is set and the main loop
 // will start the destination-side mission (waiting for exit door open / robot exit).
@@ -251,7 +250,11 @@ static bool send_espnow_event(espnow_event_type_t event_type, uint8_t floor_id)
 
 static bool send_floor_event(espnow_event_type_t event_type, uint8_t floor_id)
 {
-    return send_espnow_event(event_type, floor_id);
+    bool sent = send_espnow_event(event_type, floor_id);
+    if (!sent) {
+        printf("[FLOW] Failed to send %s to controller for floor %u.\n", espnow_event_type_to_string(event_type), floor_id);
+    }
+    return sent;
 }
 
 static bool ble_advertisement_is_relevant(const uint8_t *addr, int8_t rssi)
@@ -404,6 +407,12 @@ static bool process_incoming_espnow_message(const espnow_message_t *message)
         return false;
     }
 
+    if (message->floor_id != 0 && message->floor_id != floor_state.floor_id) {
+        printf("[ESP-NOW] Ignoring event %s for floor %u (this floor is %u).\n",
+               espnow_event_type_to_string(message->event_type), message->floor_id, floor_state.floor_id);
+        return true;
+    }
+
     switch (message->event_type) {
         case ESPNOW_EVENT_TYPE_SERVICE_MODE_ON:
             printf("[ESP-NOW] Controller requested service mode ON.\n");
@@ -413,14 +422,13 @@ static bool process_incoming_espnow_message(const espnow_message_t *message)
             return true;
         case EVENT_REQUEST_ELEVATOR:
             printf("[ESP-NOW] Controller requested elevator for floor %u.\n", message->floor_id);
-                    // If this request targets this floor, schedule the destination mission to start in main loop.
-                    if (message->floor_id == floor_state.floor_id) {
-                        mission_requested = true;
-                        if (ble_prints_enabled) {
-                            printf("[ESP-NOW] Mission requested for this floor; will start destination flow.\n");
-                        }
-                    }
-                    return true;
+            if (message->floor_id == floor_state.floor_id) {
+                mission_requested = true;
+                if (ble_prints_enabled) {
+                    printf("[ESP-NOW] Mission requested for this floor; starting destination flow.\n");
+                }
+            }
+            return true;
         case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN:
             printf("[ESP-NOW] Controller requested door hold.\n");
             return true;
@@ -786,7 +794,7 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    printf("[FLOW] esp32_2 initialized. Starting BLE+sensor elevator flow.\n");
+    printf("[FLOW] esp32_1 initialized. Starting BLE+sensor elevator flow.\n");
 
     elevator_state_t state =
     (ble_prox == BLE_PROX_CLOSE) ? STATE_ROBOT_CLOSE : STATE_ROBOT_FAR;
@@ -1016,7 +1024,9 @@ void app_main(void)
             case STATE_WAIT_EXIT_DOOR_OPEN:
                 if (floor_state.door_open) {
                     printf("[FLOW] Exit door opened. Holding door open while robot exits.\n");
-                    send_floor_event(ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN, floor_state.floor_id);
+                    if (send_floor_event(ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN, floor_state.floor_id)) {
+                        printf("[FLOW] HOLD_DOOR_OPEN sent to controller.\n");
+                    }
                     state = STATE_WAIT_ROBOT_EXIT_DETECTED;
                     door_open_wait_ms = 0;
                     exit_clear_hold_ms = 0;
@@ -1056,11 +1066,10 @@ void app_main(void)
 
                 if (exit_clear_timer_started &&
                     exit_clear_hold_ms >= EXIT_DOOR_HOLD_AFTER_CLEAR_MS) {
-                    printf("[FLOW] Exit hold delay elapsed. Releasing door and disabling service mode.\n");
+                    printf("[FLOW] Exit hold delay elapsed. Releasing door and marking robot as on floor 1.\n");
                     send_floor_event(ESPNOW_EVENT_TYPE_RELEASE_DOOR, floor_state.floor_id);
-                                        send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, floor_state.floor_id);
-                                        // Destination-only firmware: do not reassign current/destination floors here.
-                                        state = STATE_FINISHED;
+                    current_floor = floor_state.floor_id;
+                    state = STATE_FINISHED;
                     door_close_wait_ms = 0;
                     exit_clear_hold_ms = 0;
                     exit_clear_timer_started = false;
@@ -1069,7 +1078,7 @@ void app_main(void)
 
             case STATE_FINISHED:
                 if (!floor_state.door_open || door_close_wait_ms >= DOOR_CLOSE_TIMEOUT_MS) {
-                    printf("[FLOW] Process finished. Current floor is now %u.\n", current_floor);
+                    printf("[FLOW] Process finished. Robot is now on floor %u.\n", current_floor);
                     state = STATE_ROBOT_FAR;
                     ble_seen_ms = 0;
                     distance_confirm_ms = 0;
@@ -1084,9 +1093,8 @@ void app_main(void)
                 break;
 
             case STATE_ERROR_STUCK:
-                printf("[FSM] ERROR_STUCK: releasing door and disabling service mode for safety.\n");
+                printf("[FSM] ERROR_STUCK: releasing door for safety.\n");
                 send_floor_event(ESPNOW_EVENT_TYPE_RELEASE_DOOR, floor_state.floor_id);
-                send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, floor_state.floor_id);
                 state = STATE_ROBOT_FAR;
                 ble_seen_ms = 0;
                 distance_confirm_ms = 0;

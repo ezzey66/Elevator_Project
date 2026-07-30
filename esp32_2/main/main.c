@@ -389,6 +389,12 @@ static bool process_incoming_espnow_message(const espnow_message_t *message)
         return false;
     }
 
+    if (message->floor_id != 0 && message->floor_id != floor_state.floor_id) {
+        printf("[ESP-NOW] Ignoring event %s for floor %u (this floor is %u).\n",
+               espnow_event_type_to_string(message->event_type), message->floor_id, floor_state.floor_id);
+        return true;
+    }
+
     switch (message->event_type) {
         case ESPNOW_EVENT_TYPE_SERVICE_MODE_ON:
             printf("[ESP-NOW] Controller requested service mode ON.\n");
@@ -876,7 +882,7 @@ void app_main(void)
                     if (distance_confirm_ms >= DISTANCE_CONFIRM_MS) {
                         current_floor = floor_state.floor_id;
                         destination_floor = other_floor(current_floor);
-                        printf("[FLOW] Distance confirmed. Enabling service mode and calling floor %u.\n", current_floor);
+                        printf("[FLOW] Distance confirmed. Activating service mode and requesting floor %u.\n", current_floor);
                         send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_ON, floor_state.floor_id);
                         send_floor_event(EVENT_REQUEST_ELEVATOR, current_floor);
                         state = STATE_WAIT_ENTRY_DOOR_OPEN;
@@ -925,8 +931,9 @@ void app_main(void)
                 if (floor_state.robot_inside_elevator &&
                     entry_door_hold_ms >= ENTRY_DOOR_HOLD_AFTER_DETECT_MS &&
                     path_clear) {
-                    printf("[FLOW] Robot entered and hold delay elapsed. Releasing door hold so entry door can close.\n");
+                    printf("[FLOW] Robot entered and hold delay elapsed. Releasing door hold and requesting destination floor.\n");
                     send_floor_event(ESPNOW_EVENT_TYPE_RELEASE_DOOR, floor_state.floor_id);
+                    send_floor_event(EVENT_REQUEST_ELEVATOR, destination_floor);
                     state = STATE_WAIT_ENTRY_DOOR_CLOSED;
                     door_close_wait_ms = 0;
                     entry_door_hold_ms = 0;
@@ -935,8 +942,8 @@ void app_main(void)
 
             case STATE_WAIT_ENTRY_DOOR_CLOSED:
                 if (!floor_state.door_open) {
-                    printf("[FLOW] Entry door closed. Calling destination floor %u.\n", destination_floor);
-                    state = STATE_CALL_DESTINATION_FLOOR;
+                    printf("[FLOW] Entry door closed. Origin mission complete; waiting for the controller to continue to floor %u.\n", destination_floor);
+                    state = STATE_FINISHED;
                     door_close_wait_ms = 0;
                 } else {
                     door_close_wait_ms += FSM_TICK_MS;
@@ -996,9 +1003,8 @@ void app_main(void)
 
                 if (exit_clear_timer_started &&
                     exit_clear_hold_ms >= EXIT_DOOR_HOLD_AFTER_CLEAR_MS) {
-                    printf("[FLOW] Exit hold delay elapsed. Releasing door and disabling service mode.\n");
+                    printf("[FLOW] Exit hold delay elapsed. Releasing door.\n");
                     send_floor_event(ESPNOW_EVENT_TYPE_RELEASE_DOOR, floor_state.floor_id);
-                    send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, floor_state.floor_id);
                     current_floor = destination_floor;
                     destination_floor = other_floor(current_floor);
                     state = STATE_FINISHED;
@@ -1025,9 +1031,8 @@ void app_main(void)
                 break;
 
             case STATE_ERROR_STUCK:
-                printf("[FSM] ERROR_STUCK: releasing door and disabling service mode for safety.\n");
+                printf("[FSM] ERROR_STUCK: releasing door for safety.\n");
                 send_floor_event(ESPNOW_EVENT_TYPE_RELEASE_DOOR, floor_state.floor_id);
-                send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, floor_state.floor_id);
                 state = STATE_ROBOT_FAR;
                 ble_seen_ms = 0;
                 distance_confirm_ms = 0;
