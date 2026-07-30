@@ -12,7 +12,7 @@
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=${workspaceFolder}/build"
+    "--compile-commands-dir=c:\\Users\\alexa\\Documents\\Projects\\Elevator_Project\\controller_esp32\\build"
   ],
   "idf.portWin": "COM3",
   "idf.flashType": "UART"

@@ -6,6 +6,10 @@
 		{
 			"path": "esp32_2"
 		}
+		,
+		{
+			"path": "esp32_1"
+		}
 	],
 	"settings": {}
 }

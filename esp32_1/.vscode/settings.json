@@ -13,7 +13,7 @@
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=c:\\Users\\alexa\\esp32_2\\build"
+    "--compile-commands-dir=c:\\Users\\alexa\\esp32_1\\build"
   ],
   "idf.flashType": "UART"
 }

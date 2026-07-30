@@ -2,5 +2,8 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.22)
 
+# Use the project's custom partition table (partitions.csv at project root)
+set(PARTITION_TABLE_FILENAME "${CMAKE_SOURCE_DIR}/partitions.csv")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(esp32_2)
+project(esp32_1)

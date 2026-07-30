@@ -26,7 +26,7 @@ static void update_ble_proximity(float rssi, float stddev);
 static bool is_door_sealed(void);
 static bool is_robot_close(void);
 
-#define FLOOR_ID               2
+#define FLOOR_ID               1
 
 static int8_t last_ble_rssi = -127;
 static float filtered_ble_rssi = 0.0f;
