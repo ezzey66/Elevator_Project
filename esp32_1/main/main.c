@@ -26,7 +26,15 @@ static void update_ble_proximity(float rssi, float stddev);
 static bool is_door_sealed(void);
 static bool is_robot_close(void);
 
-#define FLOOR_ID               2
+#define FLOOR_ID               1
+
+// Dedicated destination firmware for Floor 1: disable origin-initiated mission behavior.
+// is_origin == true means this node may initiate missions (only false for FLOOR_ID==1 here).
+static const bool is_origin = (FLOOR_ID != 1);
+
+// When a controller requests this floor, mission_requested is set and the main loop
+// will start the destination-side mission (waiting for exit door open / robot exit).
+static volatile bool mission_requested = false;
 
 static int8_t last_ble_rssi = -127;
 static float filtered_ble_rssi = 0.0f;
@@ -307,12 +315,19 @@ static void update_floor_mission(void)
             } else if (ble_seen_ms >= BLE_CONFIRM_MS) {
                 floor_state.mission_request_confirmed = true;
                 if (!floor_state.elevator_request_sent) {
-                    send_espnow_event(EVENT_REQUEST_ELEVATOR, floor_state.floor_id);
-                    floor_state.elevator_request_sent = true;
-                    floor_state.mission_state = FLOOR_MISSION_WAIT_ELEVATOR;
-                }
-            }
-            break;
+                            if (is_origin) {
+                                send_espnow_event(EVENT_REQUEST_ELEVATOR, floor_state.floor_id);
+                                floor_state.elevator_request_sent = true;
+                                floor_state.mission_state = FLOOR_MISSION_WAIT_ELEVATOR;
+                            } else {
+                                // Destination firmware must not initiate missions; ignore autonomous request.
+                                if (ble_prints_enabled) {
+                                    printf("[FLOW] Autonomous elevator request suppressed (destination-only firmware).\n");
+                                }
+                            }
+                        }
+                    }
+                    break;
         case FLOOR_MISSION_WAIT_ELEVATOR:
             if (floor_state.door_open) {
                 floor_state.mission_state = FLOOR_MISSION_WAIT_DOOR_OPEN;
@@ -398,7 +413,14 @@ static bool process_incoming_espnow_message(const espnow_message_t *message)
             return true;
         case EVENT_REQUEST_ELEVATOR:
             printf("[ESP-NOW] Controller requested elevator for floor %u.\n", message->floor_id);
-            return true;
+                    // If this request targets this floor, schedule the destination mission to start in main loop.
+                    if (message->floor_id == floor_state.floor_id) {
+                        mission_requested = true;
+                        if (ble_prints_enabled) {
+                            printf("[ESP-NOW] Mission requested for this floor; will start destination flow.\n");
+                        }
+                    }
+                    return true;
         case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN:
             printf("[ESP-NOW] Controller requested door hold.\n");
             return true;
@@ -770,8 +792,9 @@ void app_main(void)
     (ble_prox == BLE_PROX_CLOSE) ? STATE_ROBOT_CLOSE : STATE_ROBOT_FAR;
     elevator_state_t last_state = state;
     uint8_t current_floor = floor_state.floor_id;
-    uint8_t destination_floor = other_floor(current_floor);
-    uint32_t door_open_wait_ms = 0;
+        // Destination-only firmware must not calculate or use a destination floor for mission initiation.
+        uint8_t destination_floor = 0;
+        uint32_t door_open_wait_ms = 0;
     uint32_t distance_confirm_ms = 0;
     uint32_t entry_door_hold_ms = 0;
     uint32_t exit_clear_hold_ms = 0;
@@ -787,6 +810,17 @@ void app_main(void)
 
         update_floor_state();
         update_floor_mission();
+        // If a controller requested this floor, start the destination flow here.
+        if (mission_requested) {
+            mission_requested = false;
+            if (state != STATE_WAIT_EXIT_DOOR_OPEN && state != STATE_WAIT_ROBOT_EXIT_DETECTED && state != STATE_WAIT_ROBOT_EXIT_CLEAR) {
+                printf("[FLOW] Controller requested this floor; starting destination flow (wait for exit door).\n");
+                state = STATE_WAIT_EXIT_DOOR_OPEN;
+                door_open_wait_ms = 0;
+                exit_clear_hold_ms = 0;
+                exit_clear_timer_started = false;
+            }
+        }
         bool path_clear = !floor_state.robot_detected;
 
         if (state != last_state) {
@@ -857,11 +891,20 @@ void app_main(void)
                 }
                 ble_seen_ms += FSM_TICK_MS;
                 if (ble_seen_ms >= BLE_CONFIRM_MS) {
-                    printf("[FLOW] BLE close confirmed. Waiting for distance sensor confirmation.\n");
-                    state = STATE_CONFIRM_DISTANCE;
-                    distance_confirm_ms = 0;
-                }
-                break;
+                                    if (is_origin) {
+                                        printf("[FLOW] BLE close confirmed. Waiting for distance sensor confirmation.\n");
+                                        state = STATE_CONFIRM_DISTANCE;
+                                        distance_confirm_ms = 0;
+                                    } else {
+                                        // As a dedicated destination node, do not initiate a mission on local BLE detection.
+                                        if (ble_prints_enabled) {
+                                            printf("[FLOW] BLE close confirmed but origin actions disabled on this floor.\n");
+                                        }
+                                        // Reset confirmation timer so we don't repeatedly log this.
+                                        ble_seen_ms = 0;
+                                    }
+                                }
+                                break;
 
             case STATE_CONFIRM_DISTANCE:
                 if (!floor_state.beacon_near) {
@@ -874,24 +917,41 @@ void app_main(void)
                 if (floor_state.robot_detected) {
                     distance_confirm_ms += FSM_TICK_MS;
                     if (distance_confirm_ms >= DISTANCE_CONFIRM_MS) {
-                        current_floor = floor_state.floor_id;
-                        destination_floor = other_floor(current_floor);
-                        printf("[FLOW] Distance confirmed. Enabling service mode and calling floor %u.\n", current_floor);
-                        send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_ON, floor_state.floor_id);
-                        send_floor_event(EVENT_REQUEST_ELEVATOR, current_floor);
-                        state = STATE_WAIT_ENTRY_DOOR_OPEN;
-                        door_open_wait_ms = 0;
-                    }
-                } else {
-                    distance_confirm_ms = 0;
-                }
+                                        if (is_origin) {
+                                            current_floor = floor_state.floor_id;
+                                            // Origin code previously calculated a destination and initiated the mission.
+                                            // Destination-only firmware must not do that.
+                                            printf("[FLOW] Distance confirmed. (Origin-only behavior) Enabling service mode and calling floor %u.\n", current_floor);
+                                            send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_ON, floor_state.floor_id);
+                                            send_floor_event(EVENT_REQUEST_ELEVATOR, current_floor);
+                                            state = STATE_WAIT_ENTRY_DOOR_OPEN;
+                                            door_open_wait_ms = 0;
+                                        } else {
+                                            // Destination node: ignore local distance confirmation for mission initiation.
+                                            if (ble_prints_enabled) {
+                                                printf("[FLOW] Distance confirmed but origin actions suppressed (destination-only firmware).\n");
+                                            }
+                                            distance_confirm_ms = 0;
+                                        }
+                                    }
+                                } else {
+                                    distance_confirm_ms = 0;
+                                }
                 break;
 
             case STATE_CALL_ORIGIN_FLOOR:
-                send_floor_event(EVENT_REQUEST_ELEVATOR, current_floor);
-                state = STATE_WAIT_ENTRY_DOOR_OPEN;
-                door_open_wait_ms = 0;
-                break;
+                            if (is_origin) {
+                                send_floor_event(EVENT_REQUEST_ELEVATOR, current_floor);
+                                state = STATE_WAIT_ENTRY_DOOR_OPEN;
+                                door_open_wait_ms = 0;
+                            } else {
+                                // Destination firmware should not call its own floor; return to idle/far monitoring.
+                                if (ble_prints_enabled) {
+                                    printf("[FLOW] STATE_CALL_ORIGIN_FLOOR reached but suppressed on destination firmware.\n");
+                                }
+                                state = STATE_ROBOT_FAR;
+                            }
+                            break;
 
             case STATE_WAIT_ENTRY_DOOR_OPEN:
                 if (floor_state.door_open) {
@@ -904,7 +964,7 @@ void app_main(void)
                 } else {
                     door_open_wait_ms += FSM_TICK_MS;
                     if (door_open_wait_ms >= DOOR_OPEN_TIMEOUT_MS) {
-                        printf("[ERROR] Door did not open at origin within timeout.\n");
+                                            printf("[ERROR] Door did not open within timeout.\n");
                         state = STATE_ERROR_STUCK;
                     }
                 }
@@ -998,10 +1058,9 @@ void app_main(void)
                     exit_clear_hold_ms >= EXIT_DOOR_HOLD_AFTER_CLEAR_MS) {
                     printf("[FLOW] Exit hold delay elapsed. Releasing door and disabling service mode.\n");
                     send_floor_event(ESPNOW_EVENT_TYPE_RELEASE_DOOR, floor_state.floor_id);
-                    send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, floor_state.floor_id);
-                    current_floor = destination_floor;
-                    destination_floor = other_floor(current_floor);
-                    state = STATE_FINISHED;
+                                        send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, floor_state.floor_id);
+                                        // Destination-only firmware: do not reassign current/destination floors here.
+                                        state = STATE_FINISHED;
                     door_close_wait_ms = 0;
                     exit_clear_hold_ms = 0;
                     exit_clear_timer_started = false;
