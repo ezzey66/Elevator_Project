@@ -307,7 +307,10 @@ static void update_floor_mission(void)
             } else if (ble_seen_ms >= BLE_CONFIRM_MS) {
                 floor_state.mission_request_confirmed = true;
                 if (!floor_state.elevator_request_sent) {
-                    send_espnow_event(EVENT_REQUEST_ELEVATOR, floor_state.floor_id);
+                    // Defer sending the elevator request here; the main FSM will
+                    // send the actual EVENT_REQUEST_ELEVATOR after distance
+                    // confirmation to avoid double-activating the relay.
+                    printf("[FLOW] Elevator request deferred until FSM confirmation.\n");
                     floor_state.elevator_request_sent = true;
                     floor_state.mission_state = FLOOR_MISSION_WAIT_ELEVATOR;
                 }

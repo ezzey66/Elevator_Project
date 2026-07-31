@@ -150,7 +150,7 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
 #define DISTANCE_CONFIRM_MS    5000
 #define ENTRY_DOOR_HOLD_AFTER_DETECT_MS 5000
 #define EXIT_DOOR_HOLD_AFTER_CLEAR_MS   5000
-#define DOOR_OPEN_TIMEOUT_MS   30000
+#define DOOR_OPEN_TIMEOUT_MS   60000
 #define DOOR_CLOSE_TIMEOUT_MS  12000
 
 // Configurable floor node identifier for this firmware.
@@ -1081,6 +1081,10 @@ void app_main(void)
                     exit_clear_hold_ms >= EXIT_DOOR_HOLD_AFTER_CLEAR_MS) {
                     printf("[FLOW] Exit hold delay elapsed. Releasing door and marking robot as on floor 1.\n");
                     send_floor_event(ESPNOW_EVENT_TYPE_RELEASE_DOOR, floor_state.floor_id);
+                    if (!is_origin && floor_state.floor_id == 1) {
+                        printf("[FLOW] Destination mission complete on floor 1. Notifying controller to disable service mode.\n");
+                        send_floor_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, floor_state.floor_id);
+                    }
                     current_floor = floor_state.floor_id;
                     state = STATE_FINISHED;
                     door_close_wait_ms = 0;
