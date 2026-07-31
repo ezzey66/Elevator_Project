@@ -1,6 +1,7 @@
 ﻿#include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -20,31 +21,29 @@
 
 #define RELAY_PULSE_MS             1000
 
-// ESP-NOW commands received from esp32_2.
-#define CMD_SERVICE_MODE_ON        "CMD_SERVICE_MODE_ON"
-#define CMD_SERVICE_MODE_OFF       "CMD_SERVICE_MODE_OFF"
-#define CMD_CALL_FLOOR_1           "CMD_CALL_FLOOR_1"
-#define CMD_CALL_FLOOR_2           "CMD_CALL_FLOOR_2"
-#define CMD_HOLD_DOOR_OPEN         "CMD_HOLD_DOOR_OPEN"
-#define CMD_RELEASE_DOOR           "CMD_RELEASE_DOOR"
-#define CMD_ROBOT_READY            "CMD_ROBOT_READY"
-#define CMD_CONTROLLER_READY       "CMD_CONTROLLER_READY"
-
-static const uint8_t peer_macs[][6] = {
-    {0x30, 0x76, 0xF5, 0xF7, 0x57, 0x48}, // ESP32_2 robot board
-};
-static const char *peer_names[] = {
-    "ESP32_2",
-};
-static const size_t peer_count = sizeof(peer_macs) / sizeof(peer_macs[0]);
-static uint8_t own_mac[6] = {0};
- 
 typedef enum {
    CTRL_IDLE = 0,
    CTRL_SERVICE_ACTIVE,
    CTRL_DOOR_HELD,
    CTRL_ERROR,
 } controller_state_t;
+
+typedef enum {
+    CTRL_FLOW_IDLE = 0,
+    CTRL_FLOW_WAITING_FOR_ORIGIN_RELEASE,
+    CTRL_FLOW_WAITING_FOR_DESTINATION_RELEASE,
+} controller_flow_state_t;
+
+typedef struct {
+    uint8_t floor_id;
+    uint8_t peer_addr[6];
+    bool active;
+} floor_peer_t;
+
+static floor_peer_t floor_peers[8] = {0};
+static uint8_t own_mac[6] = {0};
+static uint8_t robot_current_floor = 0;
+static controller_flow_state_t controller_flow_state = CTRL_FLOW_IDLE;
 
 static volatile bool pulse_floor_1_requested = false;
 static volatile bool pulse_floor_2_requested = false;
@@ -53,10 +52,6 @@ static volatile bool hold_door_active = false;
 static bool last_service_mode_active = false;
 static bool last_hold_door_active = false;
 static volatile controller_state_t controller_state = CTRL_IDLE;
-
-static bool send_command_to_robot(const char *command);
-static void set_service_mode(bool active);
-static void set_door_hold(bool active);
 
 typedef enum {
     ESPNOW_EVENT_TYPE_UNKNOWN = 0,
@@ -68,6 +63,12 @@ typedef enum {
     ESPNOW_EVENT_TYPE_ROBOT_READY,
     ESPNOW_EVENT_TYPE_CONTROLLER_READY,
 } espnow_event_type_t;
+
+static void print_mac(const uint8_t *mac);
+static bool send_espnow_event(espnow_event_type_t event_type, uint8_t floor_id);
+static void set_service_mode(bool active);
+static void set_door_hold(bool active);
+static void pulse_relay(gpio_num_t pin, const char *name);
 
 typedef struct {
     espnow_event_type_t event_type;
@@ -110,22 +111,47 @@ static bool handle_event(espnow_event_type_t event_type, uint8_t floor_id)
             set_service_mode(false);
             return true;
         case EVENT_REQUEST_ELEVATOR:
-            if (floor_id == 1) {
-                printf("[CTRL] Floor 1 requested.\n");
-                pulse_floor_1_requested = true;
-                return true;
-            } else if (floor_id == 2) {
-                printf("[CTRL] Floor 2 requested.\n");
+            if (floor_id == 2) {
+                printf("[CTRL] Floor 2 request received; preparing entry-side mission.\n");
+                robot_current_floor = 2;
                 pulse_floor_2_requested = true;
+                controller_flow_state = CTRL_FLOW_WAITING_FOR_ORIGIN_RELEASE;
+
+                // Notify the destination board that a trip is starting.
+                if (!send_espnow_event(EVENT_REQUEST_ELEVATOR, 1)) {
+                    printf("[CTRL] Warning: could not notify floor 1 destination board.\n");
+                }
+                return true;
+            } else if (floor_id == 1) {
+                printf("[CTRL] Floor 1 request received; destination-side mission is active.\n");
+                robot_current_floor = 1;
+                controller_flow_state = CTRL_FLOW_WAITING_FOR_DESTINATION_RELEASE;
                 return true;
             }
             printf("[ESP-NOW] Invalid floor_id for REQUEST_ELEVATOR: %u\n", floor_id);
             return false;
         case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN:
-            printf("[CTRL] Holding door open.\n");
+            printf("[CTRL] Holding door open for floor %u.\n", floor_id);
+            pulse_relay(RELAY_IN4_DOOR_HOLD_PIN, "DOOR HOLD / IN4");
             set_door_hold(true);
             return true;
         case ESPNOW_EVENT_TYPE_RELEASE_DOOR:
+            if (floor_id == 2 && controller_flow_state == CTRL_FLOW_WAITING_FOR_ORIGIN_RELEASE) {
+                printf("[CTRL] Origin floor 2 release received; switching to floor 1.\n");
+                set_door_hold(false);
+                robot_current_floor = 1;
+                pulse_floor_1_requested = true;
+                controller_flow_state = CTRL_FLOW_WAITING_FOR_DESTINATION_RELEASE;
+                return true;
+            }
+            if (floor_id == 1 && controller_flow_state == CTRL_FLOW_WAITING_FOR_DESTINATION_RELEASE) {
+                printf("[CTRL] Destination floor 1 release received; mission complete.\n");
+                set_door_hold(false);
+                set_service_mode(false);
+                robot_current_floor = 1;
+                controller_flow_state = CTRL_FLOW_IDLE;
+                return true;
+            }
             printf("[CTRL] Releasing door hold.\n");
             set_door_hold(false);
             return true;
@@ -149,55 +175,41 @@ static bool process_incoming_espnow_message(const espnow_message_t *message)
     return handle_event(message->event_type, message->floor_id);
 }
 
-static bool process_incoming_command(const char *command)
-{
-    if (strcmp(command, CMD_SERVICE_MODE_ON) == 0) {
-        return handle_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_ON, 0);
-    } else if (strcmp(command, CMD_SERVICE_MODE_OFF) == 0) {
-        return handle_event(ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF, 0);
-    } else if (strcmp(command, CMD_CALL_FLOOR_1) == 0) {
-        return handle_event(EVENT_REQUEST_ELEVATOR, 1);
-    } else if (strcmp(command, CMD_CALL_FLOOR_2) == 0) {
-        return handle_event(EVENT_REQUEST_ELEVATOR, 2);
-    } else if (strcmp(command, CMD_HOLD_DOOR_OPEN) == 0) {
-        return handle_event(ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN, 0);
-    } else if (strcmp(command, CMD_RELEASE_DOOR) == 0) {
-        return handle_event(ESPNOW_EVENT_TYPE_RELEASE_DOOR, 0);
-    } else if (strcmp(command, CMD_ROBOT_READY) == 0) {
-        return handle_event(ESPNOW_EVENT_TYPE_ROBOT_READY, 0);
-    }
-
-    printf("[ESP-NOW] Unknown controller command: %s\n", command);
-    return false;
-}
-
 static bool send_espnow_event(espnow_event_type_t event_type, uint8_t floor_id)
 {
-    switch (event_type) {
-        case ESPNOW_EVENT_TYPE_SERVICE_MODE_ON:
-            return send_command_to_robot(CMD_SERVICE_MODE_ON);
-        case ESPNOW_EVENT_TYPE_SERVICE_MODE_OFF:
-            return send_command_to_robot(CMD_SERVICE_MODE_OFF);
-        case EVENT_REQUEST_ELEVATOR:
-            if (floor_id == 1) {
-                return send_command_to_robot(CMD_CALL_FLOOR_1);
-            } else if (floor_id == 2) {
-                return send_command_to_robot(CMD_CALL_FLOOR_2);
-            }
-            printf("[ESP-NOW] Invalid floor_id for event REQUEST_ELEVATOR: %u\n", floor_id);
-            return false;
-        case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN:
-            return send_command_to_robot(CMD_HOLD_DOOR_OPEN);
-        case ESPNOW_EVENT_TYPE_RELEASE_DOOR:
-            return send_command_to_robot(CMD_RELEASE_DOOR);
-        case ESPNOW_EVENT_TYPE_ROBOT_READY:
-            return send_command_to_robot(CMD_ROBOT_READY);
-        case ESPNOW_EVENT_TYPE_CONTROLLER_READY:
-            return send_command_to_robot(CMD_CONTROLLER_READY);
-        default:
-            printf("[ESP-NOW] Unsupported event type for send: %s\n", espnow_event_type_to_string(event_type));
-            return false;
+    if (floor_id == 0) {
+        printf("[ESP-NOW] Cannot send event %s without a target floor.\n", espnow_event_type_to_string(event_type));
+        return false;
     }
+
+    uint8_t *peer_addr = NULL;
+    for (size_t i = 0; i < sizeof(floor_peers) / sizeof(floor_peers[0]); ++i) {
+        if (floor_peers[i].active && floor_peers[i].floor_id == floor_id) {
+            peer_addr = floor_peers[i].peer_addr;
+            break;
+        }
+    }
+
+    if (peer_addr == NULL) {
+        printf("[ESP-NOW] No peer registered for floor %u, cannot send event %s\n", floor_id, espnow_event_type_to_string(event_type));
+        return false;
+    }
+
+    espnow_message_t message = {
+        .event_type = event_type,
+        .floor_id = floor_id,
+    };
+
+    esp_err_t err = esp_now_send(peer_addr, (const uint8_t *)&message, sizeof(message));
+    if (err != ESP_OK) {
+        printf("[ESP-NOW] Failed to send event %s to floor %u (err=%d)\n", espnow_event_type_to_string(event_type), floor_id, err);
+        return false;
+    }
+
+    printf("[ESP-NOW] Sent event %s floor=%u -> ", espnow_event_type_to_string(event_type), floor_id);
+    print_mac(peer_addr);
+    printf("\n");
+    return true;
 }
 
 static void print_mac(const uint8_t *mac)
@@ -206,42 +218,43 @@ static void print_mac(const uint8_t *mac)
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-static bool add_peer(const uint8_t *mac, const char *name)
+static bool add_peer_for_floor(uint8_t floor_id, const uint8_t *mac)
 {
+    if (mac == NULL) {
+        return false;
+    }
+
+    for (size_t i = 0; i < sizeof(floor_peers) / sizeof(floor_peers[0]); ++i) {
+        if (floor_peers[i].active && floor_peers[i].floor_id == floor_id) {
+            memcpy(floor_peers[i].peer_addr, mac, ESP_NOW_ETH_ALEN);
+            return true;
+        }
+    }
+
+    for (size_t i = 0; i < sizeof(floor_peers) / sizeof(floor_peers[0]); ++i) {
+        if (!floor_peers[i].active) {
+            floor_peers[i].floor_id = floor_id;
+            memcpy(floor_peers[i].peer_addr, mac, ESP_NOW_ETH_ALEN);
+            floor_peers[i].active = true;
+            break;
+        }
+    }
+
     esp_now_peer_info_t peer_info = {};
     memcpy(peer_info.peer_addr, mac, ESP_NOW_ETH_ALEN);
     peer_info.channel = 1;
     peer_info.encrypt = false;
 
     esp_err_t err = esp_now_add_peer(&peer_info);
-    if (err != ESP_OK) {
-        printf("[ESP-NOW] Failed to add peer %s: ", name);
+    if (err != ESP_OK && err != ESP_ERR_ESPNOW_EXIST) {
+        printf("[ESP-NOW] Failed to add peer for floor %u: ", floor_id);
         print_mac(mac);
         printf(" (err=%d)\n", err);
         return false;
     }
 
-    printf("[ESP-NOW] Added peer %s: ", name);
+    printf("[ESP-NOW] Added peer for floor %u: ", floor_id);
     print_mac(mac);
-    printf("\n");
-    return true;
-}
-
-static bool send_command_to_robot(const char *command)
-{
-    if (peer_count == 0) {
-        printf("[ESP-NOW] No remote peer configured, cannot send: %s\n", command);
-        return false;
-    }
-
-    esp_err_t err = esp_now_send(peer_macs[0], (const uint8_t *)command, strlen(command));
-    if (err != ESP_OK) {
-        printf("[ESP-NOW] Failed to send: %s (err=%d)\n", command, err);
-        return false;
-    }
-
-    printf("[ESP-NOW] Sent: %s -> ", command);
-    print_mac(peer_macs[0]);
     printf("\n");
     return true;
 }
@@ -302,8 +315,18 @@ static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *da
                recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
                recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5],
                espnow_event_type_to_string(message.event_type), message.floor_id);
+        if (message.floor_id != 0) {
+            add_peer_for_floor(message.floor_id, recv_info->src_addr);
+        }
+        if (message.event_type == EVENT_REQUEST_ELEVATOR) {
+            if (message.floor_id == 2) {
+                robot_current_floor = 2;
+            } else if (message.floor_id == 1) {
+                robot_current_floor = 1;
+            }
+        }
         if (!process_incoming_espnow_message(&message)) {
-            printf("[ESP-NOW] Failed to process structured message. Falling back to text parse.\n");
+            printf("[ESP-NOW] Failed to process structured message.\n");
         }
         return;
     }
@@ -314,8 +337,6 @@ static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *da
            recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
            recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5],
            incoming);
-
-    process_incoming_command(incoming);
 }
 
 static void on_data_sent(const esp_now_send_info_t *info, esp_now_send_status_t status)
@@ -351,14 +372,8 @@ void app_main(void)
     print_mac(own_mac);
     printf("\n");
 
-    for (size_t i = 0; i < peer_count; ++i) {
-        if (!add_peer(peer_macs[i], peer_names[i])) {
-            printf("[ESP-NOW] Warning: peer %s may not be reachable.\n", peer_names[i]);
-        }
-    }
-
     relay_init();
-    send_espnow_event(ESPNOW_EVENT_TYPE_CONTROLLER_READY, 0);
+    send_espnow_event(ESPNOW_EVENT_TYPE_CONTROLLER_READY, 1);
     printf("[CTRL] Controller online. Relay mapping: IN1 service, IN2 floor1, IN3 floor2, IN4 door hold.\n");
 
     while (1) {
