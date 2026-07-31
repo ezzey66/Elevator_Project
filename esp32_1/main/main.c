@@ -28,8 +28,10 @@ static bool is_robot_close(void);
 
 #define FLOOR_ID               1
 
-// Floor 1 acts as a destination board and does not initiate elevator requests.
-static const bool is_origin = false;
+// Floor 1 starts as a destination board and does not initiate elevator requests.
+// After the robot reaches floor 1, it can enable origin capability for return trips.
+static bool is_origin = false;
+static bool origin_ready = false;
 
 // When a controller requests this floor, mission_requested is set and the main loop
 // will start the destination-side mission (waiting for exit door open / robot exit).
@@ -424,9 +426,7 @@ static bool process_incoming_espnow_message(const espnow_message_t *message)
             printf("[ESP-NOW] Controller requested elevator for floor %u.\n", message->floor_id);
             if (message->floor_id == floor_state.floor_id) {
                 mission_requested = true;
-                if (ble_prints_enabled) {
-                    printf("[ESP-NOW] Mission requested for this floor; starting destination flow.\n");
-                }
+                printf("[FLOW] Destination mission requested for this floor.\n");
             }
             return true;
         case ESPNOW_EVENT_TYPE_HOLD_DOOR_OPEN:
@@ -895,14 +895,25 @@ void app_main(void)
                     printf("[FLOW] Robot BLE lost. Returning to far state.\n");
                     state = STATE_ROBOT_FAR;
                     ble_seen_ms = 0;
+                    if (is_origin) {
+                        origin_ready = true;
+                        printf("[FLOW] Origin ready after robot left floor 1.\n");
+                    }
                     break;
                 }
                 ble_seen_ms += FSM_TICK_MS;
                 if (ble_seen_ms >= BLE_CONFIRM_MS) {
                                     if (is_origin) {
-                                        printf("[FLOW] BLE close confirmed. Waiting for distance sensor confirmation.\n");
-                                        state = STATE_CONFIRM_DISTANCE;
-                                        distance_confirm_ms = 0;
+                                        if (origin_ready) {
+                                            printf("[FLOW] BLE close confirmed. Waiting for distance sensor confirmation.\n");
+                                            state = STATE_CONFIRM_DISTANCE;
+                                            distance_confirm_ms = 0;
+                                        } else {
+                                            if (ble_prints_enabled) {
+                                                printf("[FLOW] Origin mode active but waiting for a new arrival before requesting the elevator.\n");
+                                            }
+                                            ble_seen_ms = 0;
+                                        }
                                     } else {
                                         // As a dedicated destination node, do not initiate a mission on local BLE detection.
                                         if (ble_prints_enabled) {
@@ -927,6 +938,7 @@ void app_main(void)
                     if (distance_confirm_ms >= DISTANCE_CONFIRM_MS) {
                                         if (is_origin) {
                                             current_floor = floor_state.floor_id;
+                                            destination_floor = other_floor(current_floor);
                                             // Origin code previously calculated a destination and initiated the mission.
                                             // Destination-only firmware must not do that.
                                             printf("[FLOW] Distance confirmed. (Origin-only behavior) Enabling service mode and calling floor %u.\n", current_floor);
@@ -949,6 +961,7 @@ void app_main(void)
 
             case STATE_CALL_ORIGIN_FLOOR:
                             if (is_origin) {
+                                destination_floor = other_floor(current_floor);
                                 send_floor_event(EVENT_REQUEST_ELEVATOR, current_floor);
                                 state = STATE_WAIT_ENTRY_DOOR_OPEN;
                                 door_open_wait_ms = 0;
@@ -1079,6 +1092,12 @@ void app_main(void)
             case STATE_FINISHED:
                 if (!floor_state.door_open || door_close_wait_ms >= DOOR_CLOSE_TIMEOUT_MS) {
                     printf("[FLOW] Process finished. Robot is now on floor %u.\n", current_floor);
+                    if (current_floor == 1 && !is_origin) {
+                        is_origin = true;
+                        origin_ready = false;
+                        destination_floor = other_floor(current_floor);
+                        printf("[FLOW] Floor 1 confirmed. Origin mode enabled for future return trips, waiting for robot departure.\n");
+                    }
                     state = STATE_ROBOT_FAR;
                     ble_seen_ms = 0;
                     distance_confirm_ms = 0;

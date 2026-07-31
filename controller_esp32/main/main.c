@@ -123,9 +123,15 @@ static bool handle_event(espnow_event_type_t event_type, uint8_t floor_id)
                 }
                 return true;
             } else if (floor_id == 1) {
-                printf("[CTRL] Floor 1 request received; destination-side mission is active.\n");
+                printf("[CTRL] Floor 1 request received; preparing entry-side mission from floor 1.\n");
                 robot_current_floor = 1;
-                controller_flow_state = CTRL_FLOW_WAITING_FOR_DESTINATION_RELEASE;
+                pulse_floor_1_requested = true;
+                controller_flow_state = CTRL_FLOW_WAITING_FOR_ORIGIN_RELEASE;
+
+                // Notify the destination board that a trip is starting.
+                if (!send_espnow_event(EVENT_REQUEST_ELEVATOR, 2)) {
+                    printf("[CTRL] Warning: could not notify floor 2 destination board.\n");
+                }
                 return true;
             }
             printf("[ESP-NOW] Invalid floor_id for REQUEST_ELEVATOR: %u\n", floor_id);
@@ -141,6 +147,9 @@ static bool handle_event(espnow_event_type_t event_type, uint8_t floor_id)
                 set_door_hold(false);
                 robot_current_floor = 1;
                 pulse_floor_1_requested = true;
+                if (!send_espnow_event(EVENT_REQUEST_ELEVATOR, 1)) {
+                    printf("[CTRL] Warning: failed to notify floor 1 after floor 2 origin release.\n");
+                }
                 controller_flow_state = CTRL_FLOW_WAITING_FOR_DESTINATION_RELEASE;
                 return true;
             }
