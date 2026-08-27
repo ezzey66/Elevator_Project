@@ -12,7 +12,7 @@
 #include "esp_mac.h"
 #include "esp_system.h"
 
-// Relay module mapping.
+// Relay module mapping
 // Adjust only these GPIOs if the physical wiring changes.
 #define RELAY_IN1_SERVICE_MODE_PIN GPIO_NUM_14
 #define RELAY_IN2_FLOOR_1_PIN      GPIO_NUM_13
